@@ -24,9 +24,6 @@
 [submodule "vendor/tinyxml2"]
 	path = vendor/tinyxml2
 	url = https://github.com/leethomason/tinyxml2.git
-[submodule "vendor/cpp-uri"]
-	path = vendor/cpp-uri
-	url = https://github.com/cpp-netlib/uri.git
 [submodule "vendor/picohttpparser"]
 	path = vendor/picohttpparser
 	url = https://github.com/h2o/picohttpparser.git
@@ -90,7 +87,7 @@
 	url = https://github.com/citizenfx/node.git
 [submodule "vendor/openssl"]
 	path = vendor/openssl
-	url = https://github.com/openssl/openssl.git
+	url = https://github.com/tatsuhiro-t/openssl.git
 [submodule "vendor/libopus"]
 	path = vendor/libopus
 	url = https://github.com/xiph/opus.git
@@ -129,7 +126,7 @@
 	url = https://github.com/citizenfx/reliable.io.git
 [submodule "vendor/websocketpp"]
 	path = vendor/websocketpp
-	url = https://github.com/zaphoyd/websocketpp.git
+	url = https://github.com/citizenfx/websocketpp.git
 [submodule "vendor/slikenet"]
 	path = vendor/slikenet
 	url = https://github.com/SLikeSoft/SLikeNet.git
@@ -172,3 +169,84 @@
 [submodule "vendor/nngpp"]
 	path = vendor/nngpp
 	url = https://github.com/citizenfx/nngpp.git
+[submodule "vendor/vulkan-headers"]
+	path = vendor/vulkan-headers
+	url = https://github.com/KhronosGroup/Vulkan-Headers.git
+[submodule "vendor/grpc"]
+	path = vendor/grpc
+	url = https://github.com/grpc/grpc.git
+[submodule "vendor/librw"]
+	path = vendor/librw
+	url = https://github.com/blattersturm/librw.git
+[submodule "vendor/librwgta"]
+	path = vendor/librwgta
+	url = https://github.com/aap/librwgta.git
+[submodule "vendor/labsound"]
+	path = vendor/labsound
+	url = https://github.com/LabSound/LabSound
+[submodule "vendor/libnyquist"]
+	path = vendor/libnyquist
+	url = https://github.com/ddiakopoulos/libnyquist.git
+[submodule "ext/txAdmin"]
+	path = ext/txAdmin
+	url = https://github.com/citizenfx/txAdmin.git
+[submodule "vendor/prometheus-cpp"]
+	path = vendor/prometheus-cpp
+	url = https://github.com/jupp0r/prometheus-cpp.git
+[submodule "vendor/folly"]
+	path = vendor/folly
+	url = https://github.com/facebook/folly.git
+[submodule "ext/native-doc-tooling"]
+	path = ext/native-doc-tooling
+	url = https://github.com/citizenfx/native-doc-tooling
+[submodule "vendor/concurrentqueue"]
+	path = vendor/concurrentqueue
+	url = https://github.com/cameron314/concurrentqueue.git
+[submodule "vendor/xenium"]
+	path = vendor/xenium
+	url = https://github.com/mpoeter/xenium
+[submodule "vendor/re3"]
+	path = vendor/re3
+	url = https://github.com/blattersturm/re3.git
+[submodule "vendor/rocksdb"]
+	path = vendor/rocksdb
+	url = https://github.com/facebook/rocksdb.git
+[submodule "vendor/ngtcp2"]
+	path = vendor/ngtcp2
+	url = https://github.com/ngtcp2/ngtcp2.git
+[submodule "vendor/nghttp3"]
+	path = vendor/nghttp3
+	url = https://github.com/ngtcp2/nghttp3.git
+[submodule "vendor/lua-cmsgpack"]
+	path = vendor/lua-cmsgpack
+	url = https://github.com/citizenfx/lua-cmsgpack.git
+	branch = grit
+[submodule "vendor/lua-rapidjson"]
+	path = vendor/lua-rapidjson
+	url = https://github.com/citizenfx/lua-rapidjson.git
+	branch = grit
+[submodule "vendor/lua"]
+	path = vendor/lua
+	url = https://github.com/citizenfx/lua.git
+	branch = grit
+[submodule "vendor/tinygltf"]
+	path = vendor/tinygltf
+	url = https://github.com/syoyo/tinygltf.git
+[submodule "vendor/lss"]
+	path = vendor/lss
+	url = https://chromium.googlesource.com/linux-syscall-support/
+[submodule "vendor/range-v3"]
+	path = vendor/range-v3
+	url = https://github.com/ericniebler/range-v3.git
+[submodule "vendor/eabase"]
+	path = vendor/eabase
+	url = https://github.com/electronicarts/EABase.git
+[submodule "vendor/directxtex"]
+	path = vendor/directxtex
+	url = https://github.com/microsoft/DirectXTex.git
+[submodule "vendor/hoard"]
+	path = vendor/hoard
+	url = https://github.com/emeryberger/Hoard.git
+[submodule "vendor/heap-layers"]
+	path = vendor/heap-layers
+	url = https://github.com/emeryberger/Heap-Layers.git

@@ -69,6 +69,8 @@ void InitializeDumpServer(int inheritedHandle, int parentPid)
 
 		MDRawAssertionInfo client_assert_info = { {0} };
 
+		std::wstring full_dump_path;
+
 		SIZE_T bytes_read = 0;
 		if (!ReadProcessMemory(client->process_handle(),
 			client->assert_info(),
@@ -93,6 +95,14 @@ void InitializeDumpServer(int inheritedHandle, int parentPid)
 			if (!dump_generator.GenerateDumpFile(&dumpPath))
 			{
 				return;
+			}
+
+			if (client->dump_type() & MiniDumpWithFullMemory)
+			{
+				if (!dump_generator.GenerateFullDumpFile(&full_dump_path))
+				{
+					return;
+				}
 			}
 
 			if (!dump_generator.WriteMinidump())
@@ -136,17 +146,22 @@ void InitializeDumpServer(int inheritedHandle, int parentPid)
 
 		DebugActiveProcess(GetProcessId(parentProcess));
 
-		printf("\n\n=================================================================\n\x1b[31mFXServer crashed.\x1b[0m\nA minidump can be found at %s.\n", ToNarrow(dumpPath).c_str());
+		printf("\n\n=================================================================\n\x1b[31mFXServer crashed.\x1b[0m\nA dump can be found at %s.\n", ToNarrow(dumpPath).c_str());
+
+		if (!full_dump_path.empty())
+		{
+			printf("In addition to this, a full dump file has been generated at %s.\n\n", ToNarrow(full_dump_path).c_str());
+		}
 
 		bool uploadCrashes = true;
 
-		if (uploadCrashes && HTTPUpload::SendRequest(L"https://sentry.fivem.net/api/6/minidump/?sentry_key=0081a421fd30443ca9d5f636be197e16", parameters, files, nullptr, &responseBody, &responseCode))
+		if (uploadCrashes && HTTPUpload::SendMultipartPostRequest(L"https://sentry.fivem.net/api/3/minidump/?sentry_key=15f0687e23d74681b5c1f80a0f3a00ed", parameters, files, nullptr, &responseBody, &responseCode))
 		{
 			printf("Crash report ID: %s\n", ToNarrow(responseBody).c_str());
 		}
 		else
 		{
-			printf("Failed to automatically report the crash. Please submit the minidump to the project developers.\n");
+			printf("Failed to automatically report the crash. Please submit the crash dump to the project developers.\n");
 		}
 
 		printf("=================================================================\n");
@@ -176,7 +191,7 @@ void InitializeDumpServer(int inheritedHandle, int parentPid)
 }
 
 
-bool InitializeExceptionHandler()
+bool InitializeExceptionHandler(int argc, char* argv[])
 {
 	using namespace google_breakpad;
 
@@ -200,7 +215,7 @@ bool InitializeExceptionHandler()
 		return true;
 	}
 
-	CrashGenerationClient* client = new CrashGenerationClient(L"\\\\.\\pipe\\CitizenFX_Server_Dump", (MINIDUMP_TYPE)(MiniDumpWithProcessThreadData | MiniDumpWithUnloadedModules | MiniDumpWithThreadInfo), new CustomClientInfo());
+	CrashGenerationClient* client = new CrashGenerationClient(L"\\\\.\\pipe\\CitizenFX_Server_Dump", (MINIDUMP_TYPE)(MiniDumpWithProcessThreadData | MiniDumpWithUnloadedModules | MiniDumpWithThreadInfo | MiniDumpWithFullMemory), new CustomClientInfo());
 
 	if (!client->Register())
 	{
@@ -239,7 +254,7 @@ bool InitializeExceptionHandler()
 		DWORD waitResult = WaitForSingleObject(initEvent, 7500);
 		if (!client->Register())
 		{
-			trace("Could not register with breakpad server.\n");
+			printf("Could not register with breakpad server.\n");
 		}
 	}
 
@@ -264,8 +279,173 @@ bool InitializeExceptionHandler()
 	return false;
 }
 #else
-bool InitializeExceptionHandler()
+#define HANDLE_EINTR(x) ([&]() -> decltype(x) { \
+  decltype(x) eintr_wrapper_result; \
+  do { \
+    eintr_wrapper_result = (x); \
+  } while (eintr_wrapper_result == -1 && errno == EINTR); \
+  return eintr_wrapper_result; \
+})()
+
+
+#include <spawn.h>
+#include <sys/prctl.h>
+
+#include <client/linux/handler/exception_handler.h>
+#include <client/linux/crash_generation/client_info.h>
+#include <client/linux/crash_generation/crash_generation_client.h>
+#include <client/linux/crash_generation/crash_generation_server.h>
+#include <common/linux/http_upload.h>
+
+#include <poll.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <signal.h>
+#include <unistd.h>
+
+#include <cfx_version.h>
+
+static google_breakpad::ExceptionHandler* g_exceptionHandler;
+
+void InitializeDumpServer(int serverFd, int pipeFd)
 {
+	using namespace google_breakpad;
+
+	static bool g_running = true;
+
+	static std::string crashDirectory = MakeRelativeCitPath("crashes");
+
+	CrashGenerationServer::OnClientDumpRequestCallback dumpCallback = [](void*, const ClientInfo* client, const std::string* dumpPath)
+	{
+		std::map<std::string, std::string> parameters;
+		parameters["sentry[release]"] = GIT_TAG;
+
+		std::string responseBody;
+		long responseCode;
+
+		std::map<std::string, std::string> files;
+		files["upload_file_minidump"] = *dumpPath;
+
+		printf("\n\n=================================================================\n\x1b[31mFXServer crashed.\x1b[0m\nA dump can be found at %s.\n", dumpPath->c_str());
+
+		bool uploadCrashes = true;
+		std::string ed;
+
+		if (uploadCrashes && HTTPUpload::SendRequest("https://sentry.fivem.net/api/3/minidump/?sentry_key=15f0687e23d74681b5c1f80a0f3a00ed", parameters, files, "", "", "", &responseBody, &responseCode, &ed))
+		{
+			printf("Crash report ID: %s\n", responseBody.c_str());
+		}
+		else
+		{
+			printf("Failed to automatically report the crash. Please submit the crash dump to the project developers.\n");
+		}
+
+		printf("=================================================================\n");
+	};
+
+	CrashGenerationServer server(serverFd, dumpCallback, nullptr, nullptr, nullptr, true, &crashDirectory);
+	if (server.Start())
+	{
+		uint8_t b = 1;
+    	write(pipeFd, &b, sizeof(b));
+		
+		while (true)
+		{
+			sleep(5);
+		}
+	}
+}
+
+
+bool InitializeExceptionHandler(int argc, char* argv[])
+{
+	using namespace google_breakpad;
+
+	std::string crashDirectory = MakeRelativeCitPath(_P("crashes"));
+	mkdir(crashDirectory.c_str(), 0777);
+
+	char* dumpServerBit = nullptr;
+	char* parentPidBit = nullptr;
+
+	for (int i = 0; i < argc; i++)
+	{
+		if (strstr(argv[i], "-dumpserver"))
+		{
+			dumpServerBit = strstr(argv[i], "-dumpserver");
+		}
+		else if (strstr(argv[i], "-parentppe:"))
+		{
+			parentPidBit = strstr(argv[i], "-parentppe:");
+		}
+	}
+
+	if (dumpServerBit)
+	{
+		prctl(PR_SET_PDEATHSIG, SIGKILL);
+
+		InitializeDumpServer(strtol(&dumpServerBit[12], nullptr, 10), strtol(&parentPidBit[11], nullptr, 10));
+
+		return true;
+	}
+
+	// start a dump server no matter what. POSIX is weird, so no named stuff
+	int server_fd, client_fd;
+
+	if (!CrashGenerationServer::CreateReportChannel(&server_fd, &client_fd))
+	{
+		return false;
+	}
+
+	int fds[2];
+	if (pipe(fds) == -1)
+	{
+		return false;
+	}
+
+	std::vector<char*> args;
+
+	if (access("/lib/ld-musl-x86_64.so.1", F_OK) != -1)
+	{
+		args.resize(argc + 3);
+		memcpy(args.data(), argv, argc * sizeof(char*));
+		args[argc] = strdup(va("-dumpserver:%d", server_fd));
+		args[argc + 1] = strdup(va("-parentppe:%d", fds[1]));
+	}
+	else
+	{
+		args.push_back(strdup(MakeRelativeCitPath("../../../run.sh").c_str()));
+		args.push_back(strdup(va("-dumpserver:%d", server_fd)));
+		args.push_back(strdup(va("-parentppe:%d", fds[1])));
+		args.push_back(nullptr);
+	}
+
+	posix_spawn(nullptr, args[0], nullptr, nullptr, args.data(), nullptr);
+
+	// wait for server init
+	struct pollfd pfd;
+	memset(&pfd, 0, sizeof(pfd));
+	pfd.fd = fds[0];
+	pfd.events = POLLIN | POLLERR;
+	int r = HANDLE_EINTR(poll(&pfd, 1, 5000));
+	if (r != 1 || (pfd.revents & POLLIN) != POLLIN)
+	{
+		return false;
+	}
+
+	uint8_t b;
+	read(fds[0], &b, sizeof(b));
+	close(fds[0]);
+
+	g_exceptionHandler = new ExceptionHandler(
+		MinidumpDescriptor(crashDirectory.c_str()),
+		nullptr,
+		nullptr,
+		nullptr,
+		true,
+		client_fd
+		);
+
 	return false;
 }
+
 #endif

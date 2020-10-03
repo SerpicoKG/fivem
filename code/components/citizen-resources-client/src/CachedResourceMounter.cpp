@@ -24,6 +24,7 @@
 #include <ppl.h>
 
 #include <Error.h>
+#include <ICoreGameInit.h>
 
 using fx::CachedResourceMounter;
 
@@ -90,14 +91,15 @@ fwRefContainer<fx::Resource> CachedResourceMounter::InitializeLoad(const std::st
 				// if there is one, start by creating a resource with a list component
 				fwRefContainer<fx::Resource> resource = m_manager->CreateResource(host);
 
-				fwRefContainer<ResourceCacheEntryList> entryList = new ResourceCacheEntryList();
-				resource->SetComponent(entryList);
+				fwRefContainer<ResourceCacheEntryList> entryList = resource->GetComponent<ResourceCacheEntryList>();
 
 				// and add the entries from the list to the resource
 				for (auto& entry : GetIteratorView(m_resourceEntries.equal_range(host)))
 				{
 					entryList->AddEntry(ResourceCacheEntryList::Entry{ entry.first, entry.second.basename, entry.second.remoteUrl, entry.second.referenceHash, entry.second.size, entry.second.extData });
 				}
+
+				entryList->SetInitUrl(uri);
 
 				return resource;
 			}
@@ -107,16 +109,17 @@ fwRefContainer<fx::Resource> CachedResourceMounter::InitializeLoad(const std::st
 	return nullptr;
 }
 
-fwRefContainer<vfs::Device> CachedResourceMounter::OpenResourcePackfile(const fwRefContainer<fx::Resource>& resource)
+tl::expected<fwRefContainer<vfs::Device>, fx::ResourceManagerError> CachedResourceMounter::OpenResourcePackfile(const fwRefContainer<fx::Resource>& resource)
 {
 	fwRefContainer<vfs::RagePackfile> packfile = new vfs::RagePackfile();
+	std::string errorState;
 
-	if (packfile->OpenArchive(fmt::sprintf("cache:/%s/resource.rpf", resource->GetName())))
+	if (packfile->OpenArchive(fmt::sprintf("cache:/%s/resource.rpf", resource->GetName()), &errorState))
 	{
 		return packfile;
 	}
 
-	return nullptr;
+	return tl::make_unexpected(ResourceManagerError{ fmt::sprintf("Failed to open packfile: %s", errorState) });
 }
 
 void CachedResourceMounter::AddStatusCallback(const std::string& resourceName, const std::function<void(int, int)>& callback)
@@ -129,6 +132,11 @@ void CachedResourceMounter::AddStatusCallback(const std::string& resourceName, c
 
 pplx::task<fwRefContainer<fx::Resource>> CachedResourceMounter::LoadResource(const std::string& uri)
 {
+	return LoadResourceFallback(uri);
+}
+
+pplx::task<tl::expected<fwRefContainer<fx::Resource>, fx::ResourceManagerError>> CachedResourceMounter::LoadResourceWithError(const std::string& uri)
+{
 	fwRefContainer<fx::Resource> resource = InitializeLoad(uri, nullptr);
 
 	if (resource.GetRef())
@@ -139,7 +147,7 @@ pplx::task<fwRefContainer<fx::Resource>> CachedResourceMounter::LoadResource(con
 		if (entryList->GetEntry("resource.rpf"))
 		{
 			// follow up by mounting resource.rpf (using the legacy mounter) from the resource on a background thread
-			return pplx::create_task([=]()
+			return pplx::create_task([=]() -> tl::expected<fwRefContainer<fx::Resource>, fx::ResourceManagerError>
 			{
 				m_manager->MakeCurrent();
 
@@ -156,42 +164,36 @@ pplx::task<fwRefContainer<fx::Resource>> CachedResourceMounter::LoadResource(con
 				}
 
 				// open the packfile
-				fwRefContainer<vfs::Device> packfile = OpenResourcePackfile(resource);
+				auto packfileResult = OpenResourcePackfile(resource);
 				
-				if (packfile.GetRef())
+				if (packfileResult)
 				{
 					// and mount it
 					std::string resourceRoot = "resources:/" + resource->GetName() + "/";
-					vfs::Mount(packfile, resourceRoot);
+					vfs::Mount(packfileResult.value(), resourceRoot);
 
 					// if that went well, we should be able to _open_ the resource now
-					if (!localResource->LoadFrom(resourceRoot))
-					{
-						GlobalError("Couldn't load resource %s from %s.", resource->GetName(), resourceRoot);
+					std::string errorState;
 
-						localResource = nullptr;
-					}
-					else
+					if (localResource->LoadFrom(resourceRoot, &errorState))
 					{
 						localResource->OnRemove.Connect([=]()
 						{
 							vfs::Unmount(resourceRoot);
 						});
+
+						return localResource;
 					}
-				}
-				else
-				{
-					GlobalError("Couldn't load resource packfile for %s.", resource->GetName());
 
-					localResource = nullptr;
+					return tl::make_unexpected(fx::ResourceManagerError{ fmt::sprintf("Couldn't load resource %s from %s: %s", resource->GetName(), resourceRoot, errorState) });
 				}
-
-				return localResource;
+				
+				return tl::make_unexpected(packfileResult.error());
 			}, pplx::task_options(g_schedulerWrap));
 		}
 	}
 
-	return pplx::task_from_result(fwRefContainer<fx::Resource>());
+	return pplx::task_from_result(tl::expected<fwRefContainer<fx::Resource>, fx::ResourceManagerError>(tl::make_unexpected(ResourceManagerError{ "Couldn't parse URI." })));
 }
 
 void CachedResourceMounter::AddResourceEntry(const std::string& resourceName, const std::string& basename, const std::string& referenceHash, const std::string& remoteUrl, size_t size, const std::map<std::string, std::string>& extData)
@@ -201,7 +203,15 @@ void CachedResourceMounter::AddResourceEntry(const std::string& resourceName, co
 		g_referenceHashList.insert({ referenceHash, {resourceName, basename} });
 	}
 
-	m_resourceEntries.insert({ resourceName, ResourceFileEntry{basename, referenceHash, remoteUrl, size, extData} });
+	auto refUrl = remoteUrl;
+
+	static auto icgi = Instance<ICoreGameInit>::Get();
+	if (icgi->NetProtoVersion >= 0x202004201223)
+	{
+		refUrl += "?hash=" + referenceHash;
+	}
+
+	m_resourceEntries.insert({ resourceName, ResourceFileEntry{basename, referenceHash, refUrl, size, extData} });
 }
 
 void CachedResourceMounter::RemoveResourceEntries(const std::string& resourceName)
@@ -266,5 +276,10 @@ static InitFunction initFunction([]()
 				g_statusCallbacks.erase(fileName);
 			}
 		}
+	});
+
+	fx::Resource::OnInitializeInstance.Connect([](fx::Resource* resource)
+	{
+		resource->SetComponent(new ResourceCacheEntryList());
 	});
 });

@@ -20,7 +20,6 @@
 #include <CoreConsole.h>
 #include <se/Security.h>
 
-#ifdef GTA_FIVE
 static InitFunction initFunction([] ()
 {
 	seGetCurrentContext()->AddAccessControlEntry(se::Principal{ "system.internal" }, se::Object{ "builtin" }, se::AccessType::Allow);
@@ -60,7 +59,7 @@ static InitFunction initFunction([] ()
 
 				if (!gameInit->GetGameLoaded())
 				{
-					trace("Triggering LoadGameFirstLaunch()\n");
+					trace("^2Network connected, triggering initial game load...\n");
 
 					gameInit->LoadGameFirstLaunch([]()
 					{
@@ -72,7 +71,7 @@ static InitFunction initFunction([] ()
 				}
 				else
 				{
-					trace("Triggering ReloadGame()\n");
+					trace("^2Network connected, triggering game reload...\n");
 
 					gameInit->ReloadGame();
 				}
@@ -127,4 +126,3 @@ static InitFunction initFunction([] ()
 		g_gameInit.SetGameLoaded();
 	});
 });
-#endif

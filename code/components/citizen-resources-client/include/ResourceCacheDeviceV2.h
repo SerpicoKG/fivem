@@ -1,6 +1,7 @@
 #pragma once
 
 #include <tbb/concurrent_unordered_map.h>
+#include <concurrent_queue.h>
 
 #include <optional>
 
@@ -12,6 +13,15 @@
 namespace resources
 {
 class RcdFetcher;
+
+class RcdFetchFailedException : public std::runtime_error
+{
+public:
+	RcdFetchFailedException(const std::string& reason)
+		: std::runtime_error(fmt::sprintf("Failed to fetch: %s", reason))
+	{
+	}
+};
 
 class
 #ifdef COMPILING_CITIZEN_RESOURCES_CLIENT
@@ -42,7 +52,8 @@ protected:
 
 	virtual void CloseFile() = 0;
 
-	virtual bool EnsureRead();
+public:
+	virtual bool EnsureRead(const std::function<void(bool, const std::string&)>& cb = {});
 
 protected:
 	RcdFetcher* m_fetcher;
@@ -122,11 +133,15 @@ public:
 
 	virtual concurrency::task<RcdFetchResult> FetchEntry(const std::string& fileName) = 0;
 
+	virtual void UnfetchEntry(const std::string& fileName) = 0;
+
 	virtual std::optional<std::reference_wrapper<const ResourceCacheEntryList::Entry>> GetEntryForFileName(std::string_view fileName) = 0;
 
 	virtual size_t GetLength(const std::string& fileName) = 0;
 
 	virtual bool ExistsOnDisk(const std::string& fileName) = 0;
+
+	virtual void PropagateError(const std::string& error) = 0;
 };
 
 class
@@ -152,6 +167,8 @@ public:
 
 	virtual concurrency::task<RcdFetchResult> FetchEntry(const std::string& fileName) override;
 
+	virtual void UnfetchEntry(const std::string& fileName) override;
+
 	virtual inline bool IsBlocking() override
 	{
 		return m_blocking;
@@ -164,13 +181,13 @@ public:
 		m_pathPrefix = pathPrefix;
 	}
 
-protected:
-	struct EntryStorage
+	void PropagateError(const std::string& error) override
 	{
-		concurrency::task<RcdFetchResult> task;
-	};
+		m_lastError = error;
+	}
 
-	std::mutex m_lock;
+protected:
+	static std::mutex ms_lock;
 
 public:
 	std::optional<std::reference_wrapper<const ResourceCacheEntryList::Entry>> GetEntryForFileName(std::string_view fileName);
@@ -184,11 +201,15 @@ private:
 	concurrency::task<RcdFetchResult> DoFetch(const ResourceCacheEntryList::Entry& entry);
 
 protected:
-	tbb::concurrent_unordered_map<std::string, EntryStorage> m_entries;
+	static tbb::concurrent_unordered_map<std::string, std::optional<concurrency::task<RcdFetchResult>>> ms_entries;
 
 	std::shared_ptr<ResourceCache> m_cache;
 	bool m_blocking;
 
 	std::string m_pathPrefix;
+
+	std::string m_lastError;
+
+	concurrency::concurrent_queue<THandle> m_handleDeleteQueue;
 };
 }

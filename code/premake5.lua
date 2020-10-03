@@ -33,9 +33,8 @@ root_cwd = os.getcwd()
 
 -- initialize components
 dofile('components/config.lua')
-dofile('vendor/config.lua')
-
 load_privates('privates_config.lua')
+dofile('vendor/config.lua')
 
 component
 {
@@ -78,7 +77,7 @@ workspace "CitizenMP"
 		buildoptions '/std:c++17'
 		
 		if _OPTIONS['game'] ~= 'server' then
-			buildoptions '/await'
+			buildoptions { '/await', '/d2FH4-' }
 		end
 
 		systemversion '10.0.18362.0'
@@ -89,6 +88,9 @@ workspace "CitizenMP"
 		location ((_OPTIONS['builddir'] or "build/") .. "server/" .. os.target())
 		architecture 'x64'
 		defines 'IS_FXSERVER'
+		startproject 'DuplicityMain'
+	else
+		startproject 'CitiLaunch'
 	end
 
 	local binroot = ((_OPTIONS['bindir'] or "bin/") .. _OPTIONS['game']) .. '/'
@@ -108,6 +110,12 @@ workspace "CitizenMP"
 			buildoptions '-mpclmul -maes -mssse3 -mavx2 -mrtm'
 			buildoptions '-fsanitize=address -fsanitize-recover=address'
 	end
+	
+	filter { 'action:vs*' }
+		implibdir "$(IntDir)/lib/"
+		symbolspath "$(TargetDir)dbg/$(TargetName).pdb"
+		
+	filter {}
 
 	-- debug output
 	configuration "Debug*"
@@ -130,6 +138,12 @@ workspace "CitizenMP"
 
 	configuration "game=five"
 		defines "GTA_FIVE"
+
+		filter 'language:C or language:C++'
+			architecture 'x64'
+			
+	configuration "game=rdr3"
+		defines "IS_RDR3"
 
 		filter 'language:C or language:C++'
 			architecture 'x64'
@@ -161,11 +175,17 @@ workspace "CitizenMP"
 	else
 		include 'server/launcher'
 	end
+	
+	if os.istarget('windows') then
+		include 'premake5_layout.lua'
+	end
 
 	-- TARGET: corert
 	include 'client/citicore'
-
+	
 if _OPTIONS['game'] ~= 'server' then
+	include 'client/ipfsdl'
+
 	project "CitiGame"
 		targetname "CitizenGame"
 		language "C++"
@@ -198,6 +218,12 @@ premake.override(premake.vstudio.dotnetbase, 'debugProps', function(base, cfg)
 	_p(2,'<Optimize>%s</Optimize>', iif(premake.config.isOptimizedBuild(cfg), "true", "false"))
 end)
 
+premake.override(premake.vstudio.vc2010, 'ignoreImportLibrary', function(base, cfg)
+	if cfg.flags.NoImportLib then
+		premake.vstudio.vc2010.element("IgnoreImportLibrary", nil, "true")
+	end
+end)
+
 premake.override(premake.vstudio.vc2010, 'importLanguageTargets', function(base, prj)
 	base(prj)
 
@@ -215,6 +241,28 @@ premake.override(premake.vstudio.vc2010, 'importLanguageTargets', function(base,
 		_p(2, '<PropertyGroup>')
 		_p(3, '<PostBuildEventUseInBuild Condition="\'$(LinkSkippedExecution)\' == \'True\'">false</PostBuildEventUseInBuild>')
 		_p(2, '</PropertyGroup>')
+		_p(1, '</Target>')
+	end
+	
+	local hasPreLink = false
+
+	for cfg in premake.project.eachconfig(prj) do
+		if cfg.prelinkcommands and #cfg.prelinkcommands > 0 then
+			hasPreLink = true
+			break
+		end
+	end
+
+	if hasPreLink then
+		_p(1, '<PropertyGroup>')
+		_p(2, '<PreLinkEventUseInBuild>false</PreLinkEventUseInBuild>')
+		_p(1, '</PropertyGroup>')
+		-- DoLinkOutputFilesMatch is right before PreLinkEvent; so it won't evaluate the condition yet
+		_p(1, '<Target Name="EnablePreLinkEvent" Inputs="@(Link)" Outputs="$(ProjectDir)/$(ProjectName).res" BeforeTargets="DoLinkOutputFilesMatch">')
+		-- use CreateProperty task to set property based on skipped state
+		_p(2, '<CreateProperty Value="true">')
+		_p(3, '<Output TaskParameter="ValueSetByTask" PropertyName="PreLinkEventUseInBuild" />')
+		_p(2, '</CreateProperty>')
 		_p(1, '</Target>')
 	end
 end)
@@ -296,7 +344,10 @@ if _OPTIONS['game'] ~= 'launcher' then
 		
 		if _OPTIONS['game'] ~= 'server' then
 			defines { 'USE_HYPERDRIVE' }
-			files { "client/clrcore/External/*.cs" }
+			
+			if _OPTIONS['game'] == 'five' then
+				files { "client/clrcore/External/*.cs" }
+			end
 		else
 			files { "client/clrcore/Server/*.cs" }
 		end

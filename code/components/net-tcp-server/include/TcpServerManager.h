@@ -31,12 +31,16 @@ private:
 	fwRefContainer<UvLoopHolder> m_uvLoop;
 
 public:
-	TcpServerManager();
+	TcpServerManager(const std::string& loopName = std::string("default"));
 
 	virtual ~TcpServerManager();
 
 public:
 	virtual fwRefContainer<TcpServer> CreateServer(const PeerAddress& bindAddress) override;
+
+	std::shared_ptr<uvw::Loop> GetCurrentWrapLoop();
+
+	uv_loop_t* GetCurrentLoop();
 
 	inline std::shared_ptr<uvw::Loop> GetWrapLoop()
 	{
@@ -47,6 +51,14 @@ public:
 	{
 		return m_uvLoop->GetLoop();
 	}
+
+public:
+	// callback that can be invoked *from any thread*
+	// cancel callback to reject connection
+	fwEvent<const net::PeerAddress&> OnStartConnection;
+
+	// callback that can be invoked *from any thread*
+	fwEvent<const net::PeerAddress&> OnCloseConnection;
 };
 }
 

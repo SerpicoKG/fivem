@@ -10,6 +10,7 @@
 #include "CrossLibraryInterfaces.h"
 
 #include "CefImeHandler.h"
+#include "NUIRenderHandler.h"
 
 #include <windowsx.h>
 
@@ -17,6 +18,7 @@ extern nui::GameInterface* g_nuiGi;
 
 static bool g_hasFocus = false;
 bool g_hasCursor = false;
+bool g_keepInput = false;
 static bool g_hasOverriddenFocus = false;
 extern bool g_mainUIFlag;
 POINT g_cursorPos;
@@ -26,14 +28,49 @@ bool isKeyDown(WPARAM wparam)
 	return (GetKeyState(wparam) & 0x8000) != 0;
 }
 
-static bool HasFocus()
+bool HasFocus()
 {
 	return (g_hasFocus || g_hasOverriddenFocus);
 }
 
+#include <shared_mutex>
+
+#ifdef USE_NUI_ROOTLESS
+std::shared_mutex g_nuiFocusStackMutex;
+std::list<std::string> g_nuiFocusStack;
+#endif
+
+static CefRefPtr<CefBrowser> GetFocusBrowser()
+{
+#ifdef USE_NUI_ROOTLESS
+	std::shared_lock<std::shared_mutex> lock(g_nuiFocusStackMutex);
+
+	for (const auto& entry : g_nuiFocusStack)
+	{
+		auto browser = nui::GetNUIWindowBrowser(entry);
+
+		if (browser)
+		{
+			return browser;
+		}
+	}
+
+	return {};
+#else
+	return nui::GetBrowser();
+#endif
+}
+
 namespace nui
 {
-	void GiveFocus(bool hasFocus, bool hasCursor)
+	CefBrowser* GetFocusBrowser()
+	{
+		return ::GetFocusBrowser().get();
+	}
+
+	extern fwRefContainer<NUIWindow> FindNUIWindow(fwString windowName);
+
+	void GiveFocus(const std::string& frameName, bool hasFocus, bool hasCursor)
 	{
 		if (!HasFocus() && hasFocus)
 		{
@@ -46,6 +83,82 @@ namespace nui
 
 		g_hasFocus = hasFocus;
 		g_hasCursor = hasCursor;
+
+#ifdef USE_NUI_ROOTLESS
+		auto winName = fmt::sprintf("nui_%s", frameName);
+
+		auto browser = nui::GetNUIWindowBrowser(winName);
+		auto window = FindNUIWindow(winName);
+
+		if (hasFocus)
+		{
+			// deferred-create the window if it's given focus, too
+			if (window.GetRef())
+			{
+				if (!window->GetBrowser())
+				{
+					window->DeferredCreate();
+				}
+			}
+
+			static std::string oldDD;
+			std::unique_lock<std::shared_mutex> lock(g_nuiFocusStackMutex);
+
+			// remove from focus stack so it can be moved on top
+			for (auto it = g_nuiFocusStack.begin(); it != g_nuiFocusStack.end();)
+			{
+				if (*it == winName)
+				{
+					it = g_nuiFocusStack.erase(it);
+				}
+				else
+				{
+					++it;
+				}
+			}
+
+			g_nuiFocusStack.push_front(winName);
+
+			if (oldDD != g_nuiFocusStack.front())
+			{
+				if (browser)
+				{
+					auto rh = browser->GetHost()->GetClient()->GetRenderHandler();
+					NUIRenderHandler* nrh = (NUIRenderHandler*)rh.get();
+
+					RevokeDragDrop(g_nuiGi->GetHWND());
+					
+					HRESULT hr = RegisterDragDrop(g_nuiGi->GetHWND(), nrh->GetDropTarget());
+					if (FAILED(hr))
+					{
+						trace("registering drag/drop failed. hr: %08x\n", hr);
+					}
+				}
+			}
+		}
+		else
+		{
+			RevokeDragDrop(g_nuiGi->GetHWND());
+		}
+
+		if (browser)
+		{
+			browser->GetHost()->SetFocus(hasFocus);
+		}
+		else
+		{
+			if (window.GetRef())
+			{
+				window->PushLoadQueue([window, hasFocus]()
+				{
+					if (window->GetBrowser())
+					{
+						window->GetBrowser()->GetHost()->SetFocus(hasFocus);
+					}
+				});
+			}
+		}
+#endif
 	}
 
 	void OverrideFocus(bool hasFocus)
@@ -60,6 +173,20 @@ namespace nui
 		}
 
 		g_hasOverriddenFocus = hasFocus;
+	}
+
+	void KeepInput(bool keepInput)
+	{
+		if (keepInput && HasFocus())
+		{
+			g_nuiGi->SetGameMouseFocus(true);
+		}
+		else if (!keepInput && HasFocus())
+		{
+			g_nuiGi->SetGameMouseFocus(false);
+		}
+
+		g_keepInput = keepInput;
 	}
 
 	void ProcessInput()
@@ -197,12 +324,35 @@ int GetCefMouseModifiers() {
 	return modifiers;
 }
 
+static void AlterKeyEventForAltGr(CefKeyEvent& event, WPARAM wParam)
+{
+	// mimic alt-gr check behaviour from
+	// src/ui/events/win/events_win_utils.cc: GetModifiersFromKeyState
+	if ((event.type == KEYEVENT_CHAR) && isKeyDown(VK_RMENU))
+	{
+		// reverse AltGr detection taken from PlatformKeyMap::UsesAltGraph
+		// instead of checking all combination for ctrl-alt, just check current char
+		HKL current_layout = ::GetKeyboardLayout(0);
+
+		// https://docs.microsoft.com/en-gb/windows/win32/api/winuser/nf-winuser-vkkeyscanexw
+		// ... high-order byte contains the shift state,
+		// which can be a combination of the following flag bits.
+		// 2 Either CTRL key is pressed.
+		// 4 Either ALT key is pressed.
+		SHORT scan_res = ::VkKeyScanExW(wParam, current_layout);
+		if (((scan_res >> 8) & 0xFF) == (2 | 4))
+		{ // ctrl-alt pressed
+			event.modifiers &= ~(EVENTFLAG_CONTROL_DOWN | EVENTFLAG_ALT_DOWN);
+			event.modifiers |= EVENTFLAG_ALTGR_DOWN;
+		}
+	}
+}
 
 static HookFunction initFunction([] ()
 {
 	g_nuiGi->QueryMayLockCursor.Connect([](int& argPtr)
 	{
-		if (HasFocus())
+		if (HasFocus() && !g_keepInput)
 		{
 			argPtr = 0;
 		}
@@ -221,7 +371,7 @@ static HookFunction initFunction([] ()
 			keyEvent.modifiers = GetCefKeyboardModifiers(vKey, scanCode);
 			keyEvent.type = (down) ? KEYEVENT_RAWKEYDOWN : KEYEVENT_KEYUP;
 
-			auto browser = nui::GetBrowser();
+			auto browser = GetFocusBrowser();
 
 			if (browser)
 			{
@@ -262,7 +412,7 @@ static HookFunction initFunction([] ()
 
 			if (button == -1)
 			{
-				auto browser = nui::GetBrowser();
+				auto browser = GetFocusBrowser();
 
 				if (browser)
 				{
@@ -296,7 +446,7 @@ static HookFunction initFunction([] ()
 				mouse_event.y = y;
 				mouse_event.modifiers = GetCefMouseModifiers();
 
-				auto browser = nui::GetBrowser();
+				auto browser = GetFocusBrowser();
 
 				if (browser)
 				{
@@ -308,7 +458,7 @@ static HookFunction initFunction([] ()
 				CefBrowserHost::MouseButtonType btnType =
 					((button == 0) ? MBT_LEFT : ((button == 1) ? MBT_RIGHT : MBT_MIDDLE));
 
-				auto browser = nui::GetBrowser();
+				auto browser = GetFocusBrowser();
 
 				if (browser)
 				{
@@ -343,7 +493,7 @@ static HookFunction initFunction([] ()
 
 		virtual void MouseWheel(int deltaY) override
 		{
-			auto browser = nui::GetBrowser();
+			auto browser = GetFocusBrowser();
 
 			if (browser) {
 				int delta = deltaY * 120;
@@ -371,7 +521,7 @@ static HookFunction initFunction([] ()
 
 	g_nuiGi->QueryInputTarget.Connect([](std::vector<InputTarget*>& targets)
 	{
-		auto browser = nui::GetBrowser();
+		auto browser = GetFocusBrowser();
 
 		if (browser)
 		{
@@ -412,7 +562,7 @@ static HookFunction initFunction([] ()
 		}
 
 		// send a focus event to CEF if focus changed
-		auto browser = nui::GetBrowser();
+		auto browser = GetFocusBrowser();
 
 		if (browser)
 		{
@@ -449,8 +599,11 @@ static HookFunction initFunction([] ()
 				
 				inputTarget.MouseEvent(btnType, x, y, true);
 
-				pass = false;
-				lresult = FALSE;
+				if (!g_keepInput)
+				{
+					pass = false;
+					lresult = FALSE;
+				}
 			} break;
 
 			case WM_LBUTTONUP:
@@ -464,8 +617,11 @@ static HookFunction initFunction([] ()
 
 				inputTarget.MouseEvent(btnType, x, y, false);
 
-				pass = false;
-				lresult = FALSE;
+				if (!g_keepInput)
+				{
+					pass = false;
+					lresult = FALSE;
+				}
 
 				break;
 			}
@@ -485,8 +641,11 @@ static HookFunction initFunction([] ()
 
 				inputTarget.MouseEvent(-1, x, y, true);
 
-				pass = false;
-				lresult = FALSE;
+				if (!g_keepInput)
+				{
+					pass = false;
+					lresult = FALSE;
+				}
 				break;
 			}
 
@@ -501,7 +660,7 @@ static HookFunction initFunction([] ()
 					mouseTracking = false;
 				}
 
-				auto browser = nui::GetBrowser();
+				auto browser = GetFocusBrowser();
 
 				if (browser) {
 					// Determine the cursor position in screen coordinates.
@@ -516,15 +675,21 @@ static HookFunction initFunction([] ()
 					browser->GetHost()->SendMouseMoveEvent(mouse_event, true);
 				}
 
-				pass = false;
-				lresult = FALSE;
+				if (!g_keepInput)
+				{
+					pass = false;
+					lresult = FALSE;
+				}
 			} break;
 
 			case WM_MOUSEWHEEL: {
 				inputTarget.MouseWheel(GET_WHEEL_DELTA_WPARAM(wParam) / 120);
 
-				pass = false;
-				lresult = FALSE;
+				if (!g_keepInput)
+				{
+					pass = false;
+					lresult = FALSE;
+				}
 				break;
 			}
 			}
@@ -532,6 +697,12 @@ static HookFunction initFunction([] ()
 			if (msg == WM_KEYUP || msg == WM_KEYDOWN)
 			{
 				inputTarget.KeyEvent(wParam, lParam, (msg == WM_KEYDOWN));
+
+				if (!g_keepInput)
+				{
+					pass = false;
+					lresult = FALSE;
+				}
 			}
 			else if (msg == WM_CHAR)
 			{
@@ -550,10 +721,11 @@ static HookFunction initFunction([] ()
 					keyEvent.type = KEYEVENT_CHAR;
 				}
 
-				auto browser = nui::GetBrowser();
+				auto browser = GetFocusBrowser();
 
 				if (browser)
 				{
+					AlterKeyEventForAltGr(keyEvent, wParam);
 					browser->GetHost()->SendKeyEvent(keyEvent);
 				}
 
@@ -561,7 +733,7 @@ static HookFunction initFunction([] ()
 				lresult = FALSE;
 				return;
 			}
-			else if (msg == WM_INPUT && g_hasCursor)
+			else if (msg == WM_INPUT && g_hasCursor && !g_keepInput)
 			{
 				pass = false;
 				lresult = TRUE;
@@ -576,8 +748,11 @@ static HookFunction initFunction([] ()
 					g_imeHandler->ResetComposition();
 				}
 
-				pass = false;
-				lresult = FALSE;
+				if (!g_keepInput)
+				{
+					pass = false;
+					lresult = FALSE;
+				}
 				return;
 			}
 			else if (msg == WM_IME_SETCONTEXT)
@@ -594,13 +769,16 @@ static HookFunction initFunction([] ()
 					g_imeHandler->MoveImeWindow();
 				}
 
-				pass = false;
-				lresult = false;
+				if (!g_keepInput)
+				{
+					pass = false;
+					lresult = FALSE;
+				}
 				return;
 			}
 			else if (msg == WM_IME_COMPOSITION)
 			{
-				auto browser = nui::GetBrowser();
+				auto browser = GetFocusBrowser();
 
 				if (browser && g_imeHandler) {
 					CefString cTextStr;
@@ -640,8 +818,11 @@ static HookFunction initFunction([] ()
 					}
 				}
 
-				pass = false;
-				lresult = false;
+				if (!g_keepInput)
+				{
+					pass = false;
+					lresult = FALSE;
+				}
 
 				return;
 			}
@@ -651,12 +832,15 @@ static HookFunction initFunction([] ()
 				g_imeHandler->ResetComposition();
 				g_imeHandler->DestroyImeWindow();
 
-				pass = false;
-				lresult = false;
+				if (!g_keepInput)
+				{
+					pass = false;
+					lresult = FALSE;
+				}
 
 				return;
 			}
-			else if (msg == WM_IME_KEYLAST || msg == WM_IME_KEYDOWN || msg == WM_IME_KEYUP)
+			else if ((msg == WM_IME_KEYLAST || msg == WM_IME_KEYDOWN || msg == WM_IME_KEYUP) && !g_keepInput)
 			{
 				pass = false;
 				lresult = false;

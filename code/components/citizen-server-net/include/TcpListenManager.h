@@ -8,6 +8,8 @@
 #include <ServerInstanceBase.h>
 #include <ComponentHolder.h>
 
+#include <tbb/concurrent_unordered_map.h>
+
 #ifdef COMPILING_CITIZEN_SERVER_NET
 #define CSNET_EXPORT DLL_EXPORT
 #else
@@ -29,12 +31,18 @@ namespace fx
 
 		std::shared_ptr<ConVar<int>> m_primaryPortVar;
 
+		std::shared_ptr<ConVar<int>> m_tcpLimitVar;
+
+		tbb::concurrent_unordered_map<std::string, std::atomic<int>> m_tcpLimitByHost;
+
+		int m_tcpLimit = 16;
+
 		int m_primaryPort;
 
 	public:
-		TcpListenManager();
+		TcpListenManager(const std::string& loopName = "default");
 
-		void Initialize();
+		void Initialize(const std::string& loopName = "default");
 
 		void AddEndpoint(const std::string& endPoint);
 

@@ -7,6 +7,8 @@
 
 #include "StdInc.h"
 #include <ShlObj.h>
+#include <optional>
+#include <CfxLocale.h>
 
 #include <wrl.h>
 
@@ -63,7 +65,13 @@ std::optional<int> EnsureGamePath()
 
 		if (path[0] != L'\0')
 		{
-			return {};
+			// check stuff regarding the game executable
+			std::wstring gameExecutable = fmt::sprintf(L"%s\\%s", path, GAME_EXECUTABLE);
+
+			if (GetFileAttributes(gameExecutable.c_str()) != INVALID_FILE_ATTRIBUTES)
+			{
+				return {};
+			}
 		}
 	}
 
@@ -96,7 +104,7 @@ std::optional<int> EnsureGamePath()
 #ifndef GTA_FIVE
 	fileDialog->SetTitle(L"Select the folder containing " GAME_EXECUTABLE);
 #else
-	fileDialog->SetTitle(L"Select the folder containing Grand Theft Auto V");
+	fileDialog->SetTitle(gettext(L"Select the folder containing Grand Theft Auto V").c_str());
 
 	// set the default folder, if we can find one
 	{
@@ -106,6 +114,7 @@ std::optional<int> EnsureGamePath()
 		// 5 is the amount of characters to strip off the end
 		const std::tuple<std::wstring, std::wstring, int> folderAttempts[] = {
 			{ L"InstallFolderSteam", L"SOFTWARE\\WOW6432Node\\Rockstar Games\\GTAV", 5 },
+			{ L"InstallFolderEpic", L"SOFTWARE\\Rockstar Games\\Grand Theft Auto V", 0 },
 			{ L"InstallFolder", L"SOFTWARE\\WOW6432Node\\Rockstar Games\\Grand Theft Auto V", 0 }
 		};
 
@@ -190,7 +199,7 @@ std::optional<int> EnsureGamePath()
 		else
 #endif
 		{
-			MessageBox(nullptr, L"The selected path does not contain a " GAME_EXECUTABLE L" file.", PRODUCT_NAME, MB_OK | MB_ICONWARNING);
+			MessageBox(nullptr, va(gettext(L"The selected path does not contain a %s file."), GAME_EXECUTABLE), PRODUCT_NAME, MB_OK | MB_ICONWARNING);
 		}
 
 		return 0;

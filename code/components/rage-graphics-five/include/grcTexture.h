@@ -140,9 +140,11 @@ public:
 struct grcManualTextureDef
 {
 	int isStaging;
-	char pad[32];
+	char pad[20];
+	int isRenderTarget;
+	char pad2[8];
 	int arraySize;
-	char pad2[16];
+	char pad3[16];
 };
 
 class grcTextureFactory
@@ -174,7 +176,6 @@ private:
 	virtual void v9() = 0;
 	virtual void v10() = 0;
 	virtual void v11() = 0;
-	virtual void v12() = 0;
 
 public:
 	virtual grcTexture* createFromNativeTexture(const char* name, ID3D11Resource* nativeResource, void* a3) = 0;
@@ -184,22 +185,16 @@ public:
 
 	static GAMESPEC_EXPORT grcTextureFactory* getInstance();
 };
+
+class GAMESPEC_EXPORT grcResourceCache
+{
+public:
+	static grcResourceCache* GetInstance();
+
+	void QueueDelete(void* graphicsResource);
+
+	void FlushQueue();
+};
 }
-
-extern
-#ifdef COMPILING_RAGE_GRAPHICS_PAYNE
-	__declspec(dllexport)
-#else
-	__declspec(dllimport)
-#endif
-	fwEvent<> OnD3DPostReset;
-
-extern
-#ifdef COMPILING_RAGE_GRAPHICS_PAYNE
-	__declspec(dllexport)
-#else
-	__declspec(dllimport)
-#endif
-	fwEvent<> OnPostFrontEndRender;
 
 void GAMESPEC_EXPORT ClearRenderTarget(bool a1, int value1, bool a2, float value2, bool a3, int value3);

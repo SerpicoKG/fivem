@@ -7,6 +7,8 @@
 
 #include <scrBind.h>
 
+#include <CrossBuildRuntime.h>
+
 #define RAGE_FORMATS_GAME five
 #define RAGE_FORMATS_GAME_FIVE
 
@@ -16,6 +18,7 @@
 #include <Resource.h>
 #include <fxScripting.h>
 #include <VFSManager.h>
+#include <VFSWin32.h>
 
 #include <grcTexture.h>
 
@@ -24,6 +27,7 @@
 #include <wrl.h>
 #include <wincodec.h>
 
+#define WANT_CEF_INTERNALS
 #include <CefOverlay.h>
 
 #include <NetLibrary.h>
@@ -45,7 +49,7 @@ public:
 
 	RuntimeTex(rage::grcTexture* texture, const void* data, size_t size);
 
-	RuntimeTex(rage::grcTexture* texture);
+	RuntimeTex(rage::grcTexture* texture, bool owned = true);
 
 	virtual ~RuntimeTex();
 
@@ -61,6 +65,11 @@ public:
 
 	void Commit();
 
+	inline void SetReferenceData(fwRefContainer<fwRefCountable> reference)
+	{
+		m_reference = reference;
+	}
+
 	inline rage::grcTexture* GetTexture()
 	{
 		return m_texture;
@@ -69,9 +78,13 @@ public:
 private:
 	rage::grcTexture* m_texture;
 
+	fwRefContainer<fwRefCountable> m_reference;
+
 	int m_pitch;
 
 	std::vector<uint8_t> m_backingPixels;
+
+	bool m_owned;
 };
 
 class RuntimeTxd
@@ -95,6 +108,7 @@ private:
 };
 
 RuntimeTex::RuntimeTex(const char* name, int width, int height)
+	: m_owned(true)
 {
 	rage::grcManualTextureDef textureDef;
 	memset(&textureDef, 0, sizeof(textureDef));
@@ -117,21 +131,25 @@ RuntimeTex::RuntimeTex(const char* name, int width, int height)
 }
 
 RuntimeTex::RuntimeTex(rage::grcTexture* texture, const void* data, size_t size)
-	: m_texture(texture)
+	: m_texture(texture), m_owned(true)
 {
 	m_backingPixels.resize(size);
 	memcpy(&m_backingPixels[0], data, m_backingPixels.size());
 }
 
-RuntimeTex::RuntimeTex(rage::grcTexture* texture)
-	: m_texture(texture)
+RuntimeTex::RuntimeTex(rage::grcTexture* texture, bool owned)
+	: m_texture(texture), m_owned(owned)
 {
 	m_backingPixels.resize(0);
 }
 
 RuntimeTex::~RuntimeTex()
 {
-	delete m_texture;
+	if (m_owned)
+	{
+		delete m_texture;
+		m_texture = nullptr;
+	}
 }
 
 int RuntimeTex::GetWidth()
@@ -254,7 +272,10 @@ RuntimeTex* RuntimeTxd::CreateTextureFromDui(const char* name, const char* duiHa
 		return nullptr;
 	}
 
-	auto tex = std::make_shared<RuntimeTex>((rage::grcTexture*)nui::GetWindowTexture(duiHandle)->GetHostTexture());
+	auto texture = nui::GetWindowTexture(duiHandle);
+	auto tex = std::make_shared<RuntimeTex>((rage::grcTexture*)texture->GetHostTexture(), false);
+	tex->SetReferenceData(texture);
+
 	m_txd->Add(name, tex->GetTexture());
 
 	m_textures[name] = tex;
@@ -266,84 +287,6 @@ RuntimeTex* RuntimeTxd::CreateTextureFromDui(const char* name, const char* duiHa
 #pragma comment(lib, "windowscodecs.lib")
 
 ComPtr<IWICImagingFactory> g_imagingFactory;
-
-class VfsStream : public Microsoft::WRL::RuntimeClass<Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>, IStream>
-{
-private:
-	fwRefContainer<vfs::Stream> m_stream;
-
-public:
-	VfsStream(fwRefContainer<vfs::Stream> stream)
-	{
-		m_stream = stream;
-	}
-
-	// Inherited via RuntimeClass
-	virtual HRESULT Read(void * pv, ULONG cb, ULONG * pcbRead) override
-	{
-		*pcbRead = m_stream->Read(pv, cb);
-
-		return S_OK;
-	}
-	virtual HRESULT Write(const void * pv, ULONG cb, ULONG * pcbWritten) override
-	{
-		*pcbWritten = m_stream->Write(pv, cb);
-		return S_OK;
-	}
-	virtual HRESULT Seek(LARGE_INTEGER dlibMove, DWORD dwOrigin, ULARGE_INTEGER * plibNewPosition) override
-	{
-		auto p = m_stream->Seek(dlibMove.QuadPart, dwOrigin);
-
-		if (plibNewPosition)
-		{
-			plibNewPosition->QuadPart = p;
-		}
-
-		return S_OK;
-	}
-
-	virtual HRESULT SetSize(ULARGE_INTEGER libNewSize) override
-	{
-		return E_NOTIMPL;
-	}
-	virtual HRESULT CopyTo(IStream * pstm, ULARGE_INTEGER cb, ULARGE_INTEGER * pcbRead, ULARGE_INTEGER * pcbWritten) override
-	{
-		return E_NOTIMPL;
-	}
-	virtual HRESULT Commit(DWORD grfCommitFlags) override
-	{
-		return E_NOTIMPL;
-	}
-	virtual HRESULT Revert(void) override
-	{
-		return E_NOTIMPL;
-	}
-	virtual HRESULT LockRegion(ULARGE_INTEGER libOffset, ULARGE_INTEGER cb, DWORD dwLockType) override
-	{
-		return E_NOTIMPL;
-	}
-	virtual HRESULT UnlockRegion(ULARGE_INTEGER libOffset, ULARGE_INTEGER cb, DWORD dwLockType) override
-	{
-		return E_NOTIMPL;
-	}
-	virtual HRESULT Stat(STATSTG * pstatstg, DWORD grfStatFlag) override
-	{
-		pstatstg->cbSize.QuadPart = m_stream->GetLength();
-		pstatstg->type = STGTY_STREAM;
-		pstatstg->grfMode = STGM_READ;
-
-		return S_OK;
-	}
-	virtual HRESULT Clone(IStream ** ppstm) override
-	{
-		return E_NOTIMPL;
-	}
-};
-
-static ComPtr<IStream> CreateComStream(fwRefContainer<vfs::Stream> stream)
-{
-	return Microsoft::WRL::Make<VfsStream>(stream);
-}
 
 RuntimeTex* RuntimeTxd::CreateTextureFromImage(const char* name, const char* fileName)
 {
@@ -368,7 +311,7 @@ RuntimeTex* RuntimeTxd::CreateTextureFromImage(const char* name, const char* fil
 
 	ComPtr<IWICBitmapDecoder> decoder;
 
-	ComPtr<IStream> stream = CreateComStream(vfs::OpenRead(resource->GetPath() + "/" + fileName));
+	ComPtr<IStream> stream = vfs::CreateComStream(vfs::OpenRead(resource->GetPath() + "/" + fileName));
 
 	HRESULT hr = g_imagingFactory->CreateDecoderFromStream(stream.Get(), nullptr, WICDecodeMetadataCacheOnDemand, decoder.GetAddressOf());
 
@@ -977,6 +920,9 @@ static InitFunction initFunction([]()
 				CMapData* mapData = new CMapData();
 
 				// 1604, temp
+				// #TODOXBUILD: block 1868
+				assert(!Is2060());
+
 				*(uintptr_t*)mapData = 0x1419343E0;
 				mapData->name = HashString(nameRef.c_str());
 				mapData->contentFlags = 73;

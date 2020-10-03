@@ -9,9 +9,11 @@
 #include <MsgpackJson.h>
 #include <rapidjson/writer.h>
 
+#include <MonoThreadAttachment.h>
+
 namespace fx
 {
-ClientDeferral::ClientDeferral(fx::ServerInstanceBase* instance, const std::shared_ptr<fx::Client>& client)
+ClientDeferral::ClientDeferral(fx::ServerInstanceBase* instance, const fx::ClientSharedPtr& client)
 	: m_client(client), m_instance(instance), m_completed(false)
 {
 
@@ -246,6 +248,9 @@ TCallbackMap ClientDeferral::GetCallbacks()
 								msgpack::zone zone;
 								ConvertToMsgPack(cardJSON, cardObject, zone);
 
+								// make sure the monkeys are happy
+								MonoEnsureThreadAttached();
+
 								self->m_instance->GetComponent<fx::ResourceManager>()->CallReference<void>(functionRef.GetRef(), cardObject, cardJson);
 							}
 						}));
@@ -269,6 +274,38 @@ TCallbackMap ClientDeferral::GetCallbacks()
 		}
 
 		self->UpdateDeferrals();
+	}));
+
+	cbs["handover"] = cbComponent->CreateCallback(createDeferralCallback([](const std::shared_ptr<ClientDeferral>& self, const std::string& deferralKey, const msgpack::unpacked& unpacked)
+	{
+		auto obj = unpacked.get().as<std::vector<msgpack::object>>();
+
+		if (obj.size() >= 1)
+		{
+			try
+			{
+				auto dict = obj[0].as<std::map<std::string, msgpack::object>>();
+				
+				for (const auto& [key, value] : dict)
+				{
+					rapidjson::Document document;
+					ConvertToJSON(value, document, document.GetAllocator());
+
+					// write as a json string
+					rapidjson::StringBuffer sb;
+					rapidjson::Writer<rapidjson::StringBuffer> writer(sb);
+
+					if (document.Accept(writer))
+					{
+						self->SetHandoverData(key, { sb.GetString(), sb.GetSize() });
+					}
+				}
+			}
+			catch (msgpack::type_error& error)
+			{
+			
+			}
+		}
 	}));
 
 	return cbs;

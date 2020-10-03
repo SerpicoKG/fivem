@@ -7,6 +7,8 @@
 
 #include <CfxState.h>
 
+#include <CrossBuildRuntime.h>
+
 static WNDPROC origWndProc;
 
 static bool g_isFocused = true;
@@ -106,6 +108,14 @@ BOOL WINAPI ClipCursorWrap(const RECT* lpRekt)
 {
 	static RECT lastRect;
 	static RECT* lastRectPtr;
+
+	int may = 1;
+	InputHook::QueryMayLockCursor(may);
+
+	if (!may)
+	{
+		lpRekt = nullptr;
+	}
 
 	if ((lpRekt && !lastRectPtr) ||
 		(lastRectPtr && !lpRekt) ||
@@ -312,12 +322,12 @@ static void SetInputWrap(int a1, void* a2, void* a3, void* a4)
 
 	lastInput = curInput;
 
-	if (!a1 && !caught)
+	if (!a1 && !caught && !Is2060())
 	{
 		int off = ((*(int*)(0x142B3FD18) - 1) & 1) ? 4 : 0;
 
 		// TODO: handle flush of keyboard
-		// 1604
+		// 1604-rg
 		memcpy((void*)0x142B3FAD0, rgd->keyboardState, 256);
 		*(uint32_t*)(0x142B3FD08 + off) = curInput.mouseX;
 		*(uint32_t*)(0x142B3FD10 + off) = curInput.mouseY;
@@ -340,9 +350,20 @@ static void SetInputWrap(int a1, void* a2, void* a3, void* a4)
 
 static HookFunction hookFunction([] ()
 {
+	static int* captureCount = hook::get_address<int*>(hook::get_pattern("48 3B 05 ? ? ? ? 0F 45 CA 89 0D ? ? ? ? 48 83 C4 28", 12));
+
 	OnGameFrame.Connect([]()
 	{
 		SetInputWrap(-1, NULL, NULL, NULL);
+
+		int may = 1;
+		InputHook::QueryMayLockCursor(may);
+
+		if (!may)
+		{
+			ClipCursorWrap(nullptr);
+			*captureCount = 0;
+		}
 	});
 
 	// window procedure
@@ -376,18 +397,21 @@ static HookFunction hookFunction([] ()
 
 	// force input to be handled using WM_KEYUP/KEYDOWN, not DInput/RawInput
 
-	// disable DInput device creation
-	char* dinputCreate = hook::pattern("45 33 C9 FF 50 18 BF 26").count(1).get(0).get<char>(0);
-	hook::nop(dinputCreate, 200); // that's a lot of nops!
-	hook::nop(dinputCreate + 212, 6);
-	hook::nop(dinputCreate + 222, 6);
+	if (!Is372())
+	{
+		// disable DInput device creation
+		char* dinputCreate = hook::pattern("45 33 C9 FF 50 18 BF 26").count(1).get(0).get<char>(0);
+		hook::nop(dinputCreate, 200); // that's a lot of nops!
+		hook::nop(dinputCreate + 212, 6);
+		hook::nop(dinputCreate + 222, 6);
 
-	// jump over raw input keyboard handling
-	hook::put<uint8_t>(hook::pattern("44 39 2E 75 ? B8 FF 00 00 00").count(1).get(0).get<void>(3), 0xEB);
+		// jump over raw input keyboard handling
+		hook::put<uint8_t>(hook::pattern("44 39 2E 75 ? B8 FF 00 00 00").count(1).get(0).get<void>(3), 0xEB);
 
-	// default international keyboard mode to on
-	// (this will always use a US layout to map VKEY scan codes, instead of using the local layout)
-	hook::put<uint8_t>(hook::get_pattern("8D 48 EF 41 3B CE 76 0C", 6), 0xEB);
+		// default international keyboard mode to on
+		// (this will always use a US layout to map VKEY scan codes, instead of using the local layout)
+		hook::put<uint8_t>(hook::get_pattern("8D 48 EF 41 3B CE 76 0C", 6), 0xEB);
+	}
 
 	// fix repeated ClipCursor calls (causing DWM load)
 	hook::iat("user32.dll", ClipCursorWrap, "ClipCursor");
@@ -398,9 +422,9 @@ static HookFunction hookFunction([] ()
 
 	static HostSharedData<CfxState> initState("CfxInitState");
 
-	if (initState->isReverseGame)
+	if (initState->isReverseGame && !Is2060())
 	{
-		// 1604
+		// 1604-rg
 		// rg
 		hook::set_call(&origSetInput, 0x1407D1840);
 		hook::call(0x1407D1840, SetInputWrap);

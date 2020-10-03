@@ -14,6 +14,8 @@
 #include <FontRenderer.h>
 #include <DrawCommands.h>
 
+#include <boost/algorithm/string.hpp>
+
 void DLL_IMPORT CfxCollection_AddStreamingFileByTag(const std::string& tag, const std::string& fileName, rage::ResourceFlags flags);
 
 namespace streaming
@@ -23,6 +25,8 @@ namespace streaming
 
 namespace fx
 {
+static void MountFauxStreamingRpf(const std::string& fn);
+
 static std::list<fwRefContainer<vfs::Device>> g_devices;
 
 struct IgnoreCaseLess
@@ -96,6 +100,16 @@ public:
 		return m_parentDevice->CloseBulk(handle);
 	}
 
+	virtual size_t GetLength(THandle handle) override
+	{
+		return m_parentDevice->GetLength(handle);
+	}
+
+	virtual size_t GetLength(const std::string& fileName)
+	{
+		return m_parentDevice->GetLength(MapFileName(fileName));
+	}
+
 	virtual THandle FindFirst(const std::string & folder, vfs::FindData* findData) override
 	{
 		return THandle();
@@ -164,7 +178,7 @@ ModVFSDevice::ModVFSDevice(const std::shared_ptr<ModPackage>& package)
 			}
 
 			auto lastArchive = entry.archiveRoots.back();
-			auto srcFile = entry.targetFile;
+			auto srcFile = entry.sourceFile;
 			auto tgtFile = entry.targetFile;
 
 			std::replace(srcFile.begin(), srcFile.end(), '\\', '/');
@@ -175,8 +189,16 @@ ModVFSDevice::ModVFSDevice(const std::shared_ptr<ModPackage>& package)
 				tgtFile = tgtFile.substr(1);
 			}
 
-			if (tgtFile == "common/data/gameconfig.xml")
+			if (tgtFile == "common/data/gameconfig.xml" ||
+				tgtFile == "common/data/ai/scenarios.meta" ||
+				tgtFile == "common/data/ai/conditionalanims.meta")
 			{
+				continue;
+			}
+
+			if (boost::algorithm::ends_with(tgtFile, ".rpf"))
+			{
+				MountFauxStreamingRpf(m_modPackage->GetRootPath() + "content/" + srcFile);
 				continue;
 			}
 
@@ -228,6 +250,8 @@ std::string ModVFSDevice::MapFileName(const std::string& name)
 	return {};
 }
 
+bool loadedUnencryptedMod;
+
 bool ModsNeedEncryption()
 {
 	static ConVar<bool> modDevMode("modDevMode", ConVar_None, false);
@@ -242,6 +266,11 @@ static void MountFauxStreamingRpf(const std::string& fn)
 	fwRefContainer<vfs::RagePackfile7> packfile = new vfs::RagePackfile7();
 	if (packfile->OpenArchive(fn, ModsNeedEncryption()))
 	{
+		if (!ModsNeedEncryption())
+		{
+			loadedUnencryptedMod = true;
+		}
+
 		std::string devName;
 
 		std::string mount = fmt::sprintf("faux_pack%d:/", packIdx++);
@@ -305,7 +334,10 @@ void MountModDevice(const std::shared_ptr<fx::ModPackage>& modPackage)
 
 		g_devices.push_back(device);
 	}
+}
 
+void MountModStream(const std::shared_ptr<fx::ModPackage>& modPackage)
+{
 	// add streaming assets
 	auto parentDevice = vfs::GetDevice(modPackage->GetRootPath());
 
@@ -360,6 +392,11 @@ void MountModDevice(const std::shared_ptr<fx::ModPackage>& modPackage)
 			fwRefContainer<vfs::RagePackfile7> packfile = new vfs::RagePackfile7();
 			if (packfile->OpenArchive(fn, ModsNeedEncryption()))
 			{
+				if (!ModsNeedEncryption())
+				{
+					loadedUnencryptedMod = true;
+				}
+
 				std::string devName;
 
 				vfs::Mount(packfile, "tempModDlc:/");
@@ -381,7 +418,7 @@ void MountModDevice(const std::shared_ptr<fx::ModPackage>& modPackage)
 
 				{
 					auto contentFile = vfs::OpenRead(devName + ":/content.xml");
-					
+
 					auto text = contentFile->ReadToEnd();
 
 					tinyxml2::XMLDocument doc;
@@ -422,7 +459,7 @@ static InitFunction initFunction([]()
 {
 	OnPostFrontendRender.Connect([]()
 	{
-		if (!fx::ModsNeedEncryption())
+		if (!fx::ModsNeedEncryption() || fx::loadedUnencryptedMod)
 		{
 			TheFonts->DrawText(L"CFX MOD DEV MODE ENABLED", CRect(40.0f, 40.0f, 800.0f, 500.0f), CRGBA(255, 0, 0, 255), 40.0f, 1.0f, "Comic Sans MS");
 		}

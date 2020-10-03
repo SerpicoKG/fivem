@@ -10,6 +10,7 @@
 #include "om/OMComponent.h"
 
 #include <ScriptEngine.h>
+#include <StructuredTrace.h>
 
 #include <Resource.h>
 #include <ResourceManager.h>
@@ -101,17 +102,27 @@ public:
 
 private:
 	Resource* m_resource;
+	ScriptMetaDataComponent meta;
+
+	std::string m_lastError;
 
 private:
 	result_t WrapVFSStreamResult(fwRefContainer<vfs::Stream> stream, fxIStream** result);
 
 public:
 	TestScriptHost(Resource* resource)
-		: m_resource(resource)
+		: m_resource(resource), meta(resource)
 	{
 
 	}
 };
+
+result_t TestScriptHost::GetLastErrorText(char** text)
+{
+	*text = const_cast<char*>(m_lastError.c_str());
+
+	return FX_S_OK;
+}
 
 result_t TestScriptHost::InvokeNative(fxNativeContext & context)
 {
@@ -127,6 +138,7 @@ result_t TestScriptHost::InvokeNative(fxNativeContext & context)
 	catch (std::exception& e)
 	{
 		trace("%s: execution failed: %s\n", __func__, e.what());
+		m_lastError = e.what();
 
 		return FX_E_INVALIDARG;
 	}
@@ -149,6 +161,7 @@ result_t TestScriptHost::InvokeNative(fxNativeContext & context)
 // https://github.com/google/sanitizers/issues/749
 #if !HAS_FEATURE(address_sanitizer)
 			trace("%s: execution failed: %s\n", __func__, e.what());
+			m_lastError = e.what();
 #endif
 
 			return FX_E_INVALIDARG;
@@ -184,6 +197,8 @@ result_t TestScriptHost::WrapVFSStreamResult(fwRefContainer<vfs::Stream> stream,
 
 result_t TestScriptHost::ScriptTrace(char* string)
 {
+	StructuredTrace({ "type", "script_log" }, { "resource", m_resource->GetName() }, { "text", string });
+
 	return FX_S_OK;
 }
 
@@ -237,60 +252,27 @@ result_t TestScriptHost::CanonicalizeRef(int32_t refIdx, int32_t instanceId, cha
 
 result_t TestScriptHost::GetResourceName(char** outResourceName)
 {
-	*outResourceName = const_cast<char*>(m_resource->GetName().c_str());
-	return FX_S_OK;
+	return meta.GetResourceName(outResourceName);
 }
 
 result_t TestScriptHost::GetNumResourceMetaData(char* metaDataName, int32_t* entryCount)
 {
-	fwRefContainer<ResourceMetaDataComponent> metaData = m_resource->GetComponent<ResourceMetaDataComponent>();
-
-	auto entries = metaData->GetEntries(metaDataName);
-
-	*entryCount = static_cast<int32_t>(std::distance(entries.begin(), entries.end()));
-
-	return FX_S_OK;
+	return meta.GetNumResourceMetaData(metaDataName, entryCount);
 }
 
 result_t TestScriptHost::GetResourceMetaData(char* metaDataName, int32_t entryIndex, char** outMetaData)
 {
-	fwRefContainer<ResourceMetaDataComponent> metaData = m_resource->GetComponent<ResourceMetaDataComponent>();
-	
-	auto entries = metaData->GetEntries(metaDataName);
-
-	// and loop over the entries to see if we find anything
-	int i = 0;
-
-	for (auto& entry : entries)
-	{
-		if (entryIndex == i)
-		{
-			*outMetaData = const_cast<char*>(entry.second.c_str());
-			return FX_S_OK;
-		}
-
-		i++;
-	}
-
-	// return not-found
-	return 0x80070490;
+	return meta.GetResourceMetaData(metaDataName, entryIndex, outMetaData);
 }
 
 result_t TestScriptHost::IsManifestVersionBetween(const guid_t & lowerBound, const guid_t & upperBound, bool *_retval)
 {
-	// get the manifest version
-	auto metaData = m_resource->GetComponent<ResourceMetaDataComponent>();
+	return meta.IsManifestVersionBetween(lowerBound, upperBound, _retval);
+}
 
-	auto retval = metaData->IsManifestVersionBetween(lowerBound, upperBound);
-
-	if (retval)
-	{
-		*_retval = *retval;
-
-		return FX_S_OK;
-	}
-
-	return FX_E_INVALIDARG;
+result_t TestScriptHost::IsManifestVersionV2Between(char* lowerBound, char* upperBound, bool* _retval)
+{
+	return meta.IsManifestVersionV2Between(lowerBound, upperBound, _retval);
 }
 
 using Boundary = std::vector<uint8_t>;
@@ -352,12 +334,20 @@ class ScriptRuntimeHandler : public OMClass<ScriptRuntimeHandler, IScriptRuntime
 {
 public:
 	NS_DECL_ISCRIPTRUNTIMEHANDLER;
+
+private:
+	result_t PushRuntimeInternal(IScriptRuntime* runtime);
 };
 
 result_t ScriptRuntimeHandler::PushRuntime(IScriptRuntime* runtime)
 {
 	ms_runtimeMutex.lock();
 
+	return PushRuntimeInternal(runtime);
+}
+
+result_t ScriptRuntimeHandler::PushRuntimeInternal(IScriptRuntime* runtime)
+{
 	ms_runtimeStack.push_front(runtime);
 	ms_boundaryStack.push_front({});
 
@@ -369,6 +359,16 @@ result_t ScriptRuntimeHandler::PushRuntime(IScriptRuntime* runtime)
 	}
 	
 	return FX_S_OK;
+}
+
+result_t ScriptRuntimeHandler::TryPushRuntime(IScriptRuntime* runtime)
+{
+	if (!ms_runtimeMutex.try_lock())
+	{
+		return FX_E_INVALIDARG;
+	}
+
+	return PushRuntimeInternal(runtime);
 }
 
 result_t ScriptRuntimeHandler::PopRuntime(IScriptRuntime* runtime)

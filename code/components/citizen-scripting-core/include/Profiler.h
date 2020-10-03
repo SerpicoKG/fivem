@@ -1,6 +1,7 @@
 #pragma once
 
 #include <fmt/format.h>
+#include <tbb/concurrent_vector.h>
 
 #include <ResourceManager.h>
 
@@ -22,17 +23,25 @@ namespace fx {
 		return duration_cast<microseconds>(high_resolution_clock::now().time_since_epoch());
 	}
 
+	extern
+#ifdef COMPILING_CITIZEN_SCRIPTING_CORE
+		DLL_EXPORT
+#else
+		DLL_IMPORT
+#endif
+		bool g_recordProfilerTime;
+
 	struct ProfilerEvent {
 
 		inline ProfilerEvent(ProfilerEventType what, std::string where, std::string why)
 			: what(what), where(where), why(why)
 		{
-			when = usec();
+			when = (g_recordProfilerTime) ? usec() : std::chrono::microseconds{ 0 };
 		};
 		inline ProfilerEvent(ProfilerEventType what)
 			: what(what)
 		{
-			when = usec();
+			when = (g_recordProfilerTime) ? usec() : std::chrono::microseconds{ 0 };
 		};
 		std::chrono::microseconds when;
 		ProfilerEventType what;
@@ -48,7 +57,17 @@ namespace fx {
 #endif
 		ProfilerComponent : public fwRefCountable {
 	public:
-		void PushEvent(ProfilerEvent&& ev);
+		template<typename... TArgs>
+		inline void PushEvent(TArgs&&... args)
+		{
+			if (m_recording)
+			{
+				ProfilerEvent ev{ std::forward<TArgs>(args)... };
+
+				ev.when -= m_offset;
+				m_events.push_back(ev);
+			}
+		}
 		
 		void EnterResource(const std::string& resource, const std::string& cause);
 		void ExitResource();
@@ -64,7 +83,7 @@ namespace fx {
 
 		void StartRecording(int frames);
 		void StopRecording();
-		auto Get() -> const std::vector<ProfilerEvent>&;
+		auto Get() -> const tbb::concurrent_vector<ProfilerEvent>&;
 
 	public:
 		fwEvent<const nlohmann::json&> OnRequestView;
@@ -72,7 +91,7 @@ namespace fx {
 	private:
 		std::string m_screenshot;
 
-		std::vector<ProfilerEvent> m_events = {};
+		tbb::concurrent_vector<ProfilerEvent> m_events;
 		bool m_recording = false;
 		std::chrono::microseconds m_offset;
 		int m_frames = 0;

@@ -7,6 +7,9 @@
 
 #include <LaunchMode.h>
 
+#include <nutsnbolts.h>
+#include <CefOverlay.h>
+
 #include <mmsystem.h>
 
 #pragma comment(lib, "winmm.lib")
@@ -41,7 +44,12 @@ struct LoadScreenFuncs
 	{
 		if (data.index != 67 && data.index != 68)
 		{
-			trace("instrumented function %p (%i) took %dmsec\n", data.func, data.index, (timeGetTime() - data.tickCount));
+			auto msec = (timeGetTime() - data.tickCount);
+
+			if (msec > 50)
+			{
+				trace(__FUNCTION__ ": Instrumented function %p (%i) took %dmsec\n", data.func, data.index, msec);
+			}
 		}
 	}
 };
@@ -280,11 +288,6 @@ int CountRelevantDataFileEntries()
 	return g_instrumentedFuncs;
 }
 
-static int ReturnTrue()
-{
-	return 1;
-}
-
 static void(*dataFileMgr__loadDefDat)(void*, const char*, bool);
 
 int dlcIdx = -1;
@@ -314,6 +317,10 @@ static void LoadDefDats(void* dataFileMgr, const char* name, bool enabled)
 	}
 }
 
+static int* loadingScreenState;
+
+extern bool g_doDrawBelowLoadingScreens;
+
 static HookFunction hookFunction([] ()
 {
 	hook::jump(hook::get_pattern("44 8B D8 4D 63 C8 4C 3B C8 7D 33 8B", -0x16), &CDataFileMgr::FindNextEntry);
@@ -329,6 +336,20 @@ static HookFunction hookFunction([] ()
 	{
 		hook::return_function(hook::get_pattern("41 B8 97 96 11 96", -0x9A));
 	}
+
+	// loading screen state 10 draws postFX every frame, which will make for a lot of unneeded GPU load below NUI
+	loadingScreenState = hook::get_address<int*>(hook::get_pattern("33 D2 48 8D 45 10 39 15", 8));
+
+	OnGameFrame.Connect([]()
+	{
+		if (*loadingScreenState == 10)
+		{
+			if (nui::HasMainUI() || g_doDrawBelowLoadingScreens)
+			{
+				*loadingScreenState = 6;
+			}
+		}
+	});
 
 #if USE_OPTICK
 	struct ProfilerMetaData
@@ -383,9 +404,6 @@ static HookFunction hookFunction([] ()
 	// don't use it tends to break the profiler output
 	//InstrumentFunction<ProfilerFuncs>(hook::get_pattern("BF 01 00 00 00 84 C0 75 23 38 1D ? ? ? ? 75", -0x51), proFunctions);
 #endif
-
-	// 'should packfile meta cache be used'
-	//hook::call(hook::get_pattern("E8 ? ? ? ? E8 ? ? ? ? 84 C0 0F 84 ? ? 00 00 44 39 35", 5), ReturnTrue);
 
 	auto hookPoint = hook::pattern("E8 ? ? ? ? 48 8B 1D ? ? ? ? 41 8B F7").count(1).get(0).get<void>(0);
 	hook::set_call(&dataFileMgr__loadDefDat, hookPoint);

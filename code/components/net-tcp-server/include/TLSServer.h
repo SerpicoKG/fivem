@@ -50,11 +50,11 @@ private:
 
 private:
 	template<typename TContainer>
-	inline void DoWrite(TContainer data)
+	inline void DoWrite(TContainer data, TCompleteCallback&& onComplete)
 	{
 		fwRefContainer<TLSServerStream> thisRef = this;
 
-		ScheduleCallback([thisRef, data = std::forward<TContainer>(data)]()
+		ScheduleCallback([thisRef, data = std::forward<TContainer>(data), onComplete = std::move(onComplete)]() mutable
 		{
 			auto tlsServer = thisRef->m_tlsServer;
 
@@ -62,6 +62,7 @@ private:
 			{
 				try
 				{
+					thisRef->m_nextOnComplete = std::move(onComplete);
 					tlsServer->send(data);
 				}
 				catch (const std::exception& e)
@@ -71,7 +72,7 @@ private:
 					thisRef->Close();
 				}
 			}
-		});
+		}, true);
 	}
 
 public:
@@ -79,13 +80,38 @@ public:
 
 	virtual PeerAddress GetPeerAddress() override;
 
-	virtual void Write(std::string&& data) override;
+	virtual void Write(std::string&& data, TCompleteCallback&& onComplete) override;
 
-	virtual void Write(std::vector<uint8_t>&& data) override;
+	virtual void Write(std::vector<uint8_t>&& data, TCompleteCallback&& onComplete) override;
 
-	virtual void Write(const std::string& data) override;
+	virtual void Write(const std::string& data, TCompleteCallback&& onComplete) override;
 
-	virtual void Write(const std::vector<uint8_t>& data) override;
+	virtual void Write(const std::vector<uint8_t>& data, TCompleteCallback&& onComplete) override;
+
+	virtual void Write(std::unique_ptr<char[]> data, size_t len, TCompleteCallback&& onComplete) override
+	{
+		fwRefContainer<TLSServerStream> thisRef = this;
+
+		ScheduleCallback([thisRef, data = std::move(data), len, onComplete = std::move(onComplete)]() mutable
+		{
+			auto tlsServer = thisRef->m_tlsServer;
+
+			if (tlsServer && tlsServer->is_active())
+			{
+				try
+				{
+					thisRef->m_nextOnComplete = std::move(onComplete);
+					tlsServer->send(reinterpret_cast<const uint8_t*>(data.get()), len);
+				}
+				catch (const std::exception & e)
+				{
+					trace("tls send: %s\n", e.what());
+
+					thisRef->Close();
+				}
+			}
+		}, true);
+	}
 
 	virtual void Close() override;
 
@@ -139,7 +165,7 @@ public:
 		}
 	}
 
-	virtual void ScheduleCallback(const TScheduledCallback& callback) override;
+	virtual void ScheduleCallback(TScheduledCallback&& callback, bool performInline) override;
 
 private:
 	void WriteToClient(const uint8_t buf[], size_t length);
@@ -152,6 +178,8 @@ private:
 
 private:
 	void CloseInternal();
+
+	TCompleteCallback m_nextOnComplete;
 };
 
 class TCP_SERVER_EXPORT TLSServer : public TcpServer
@@ -162,6 +190,8 @@ private:
 	std::shared_ptr<Botan::Credentials_Manager> m_credentials;
 
 	std::set<fwRefContainer<TLSServerStream>> m_connections;
+
+	std::mutex m_connectionsMutex;
 
 	std::vector<std::string> m_protocols;
 
@@ -195,6 +225,7 @@ public:
 
 	inline void CloseStream(TLSServerStream* stream)
 	{
+		std::lock_guard<std::mutex> _(m_connectionsMutex);
 		m_connections.erase(stream);
 	}
 };

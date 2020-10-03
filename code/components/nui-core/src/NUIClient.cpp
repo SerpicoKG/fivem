@@ -8,6 +8,7 @@
 #include "StdInc.h"
 #include "NUIClient.h"
 #include "NUIRenderHandler.h"
+#include "NUISchemeHandlerFactory.h"
 #include "CefOverlay.h"
 #include "memdbgon.h"
 #include "HttpClient.h"
@@ -33,9 +34,12 @@ namespace nui
 }
 
 NUIClient::NUIClient(NUIWindow* window)
-	: m_window(window)
+	: m_window(window), m_windowValid(false), m_loadedMainFrame(false)
 {
-	m_windowValid = true;
+	if (m_window)
+	{
+		m_windowValid = true;
+	}
 
 	m_renderHandler = new NUIRenderHandler(this);
 
@@ -62,6 +66,8 @@ NUIClient::NUIClient(NUIWindow* window)
 					}
 				}
 			}
+
+			Instance<NUISchemeHandlerFactory>::Get()->SetRequestBlacklist(thisRef->m_requestBlacklist);
 		}
 	});
 }
@@ -73,13 +79,19 @@ void NUIClient::OnLoadStart(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> f
 		browser->GetHost()->SetAudioMuted(true);
 	}
 
-	GetWindow()->OnClientContextCreated(browser, frame, nullptr);
+	auto window = GetWindow();
+
+	if (window)
+	{
+		window->OnClientContextCreated(browser, frame, nullptr);
+	}
 }
 
 void NUIClient::OnLoadEnd(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, int httpStatusCode)
 {
 	auto url = frame->GetURL();
 
+#ifndef USE_NUI_ROOTLESS
 	if (url == "nui://game/ui/root.html")
 	{
 		static ConVar<std::string> uiUrlVar("ui_url", ConVar_None, "https://nui-game-internal/ui/app/index.html");
@@ -91,6 +103,53 @@ void NUIClient::OnLoadEnd(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> fra
 			nui::CreateFrame("mpMenu", uiUrlVar.GetValue());
 		}
 	}
+#else
+	// enter push function
+	if (frame->IsMain())
+	{
+		frame->ExecuteJavaScript(R"(
+(() => {
+	let nuiMessageQueue = [];
+
+	window.nuiInternalCallMessages = () => {
+		const mq = nuiMessageQueue;
+		nuiMessageQueue = [];
+
+		setTimeout(() => {
+			for (const msg of mq) {
+				window.postMessage(msg, '*');
+			}
+		}, 50);
+	};
+
+	window.registerPushFunction(function(type, ...args) {
+		switch (type) {
+			case 'frameCall': {
+				const [ dataString ] = args;
+				const data = JSON.parse(dataString);
+
+				window.postMessage(data, '*');
+
+				if (!window.nuiInternalHandledMessages) {
+					nuiMessageQueue.push(data);
+				}
+
+				break;
+			}
+		}
+	});
+})();
+)",
+		"nui://handler", 0);
+
+		m_loadedMainFrame = true;
+
+		if (m_window)
+		{
+			m_window->ProcessLoadQueue();
+		}
+	}
+#endif
 
 	// replace any segoe ui symbol font
 	frame->ExecuteJavaScript("[].concat.apply([], Array.from(document.styleSheets).map(a => Array.from(a.rules).filter(b => b.style && b.style.fontFamily))).forEach(a => a.style.fontFamily = a.style.fontFamily.replace(/Segoe UI Symbol/g, 'Segoe UI Emoji'));", "nui://patches", 0);
@@ -103,7 +162,7 @@ void NUIClient::OnAfterCreated(CefRefPtr<CefBrowser> browser)
 	OnClientCreated(this);
 }
 
-bool NUIClient::OnProcessMessageReceived(CefRefPtr<CefBrowser> browser, CefProcessId source_process, CefRefPtr<CefProcessMessage> message)
+bool NUIClient::OnProcessMessageReceived(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, CefProcessId source_process, CefRefPtr<CefProcessMessage> message)
 {
 	auto handler = m_processMessageHandlers.find(message->GetName());
 	bool success = false;
@@ -130,11 +189,39 @@ bool NUIClient::OnConsoleMessage(CefRefPtr<CefBrowser> browser, cef_log_severity
 	std::wstring sourceStr = source.ToWString();
 	std::wstring messageStr = message.ToWString();
 
-	std::wstringstream msg;
-	msg << sourceStr << ":" << line << ", " << messageStr << std::endl;
+	// skip websocket error messages and mpMenu messages
+	// some of these can't be blocked from script and users get very confused by them appearing in console
+	if (messageStr.find(L"WebSocket connection to") != std::string::npos || sourceStr.find(L"nui-game-internal") != std::string::npos || sourceStr.find(L"chrome-devtools") != std::string::npos)
+	{
+		return false;
+	}
 
-	OutputDebugString(msg.str().c_str());
-	trace("%s", ToNarrow(msg.str()));
+	std::string channel = "nui:console";
+
+	if (sourceStr.find(L"nui://") == 0)
+	{
+		static std::wregex re{ L"nui://(.*?)/(.*)" };
+		std::wsmatch match;
+
+		if (std::regex_search(sourceStr, match, re))
+		{
+			channel = fmt::sprintf("script:%s:nui", ToNarrow(match[1].str()));
+			sourceStr = fmt::sprintf(L"@%s/%s", match[1].str(), match[2].str());
+		}
+	}
+	else if (sourceStr.find(L"https://cfx-nui-") == 0)
+	{
+		static std::wregex re{ L"https://cfx-nui-(.*?)/(.*)" };
+		std::wsmatch match;
+
+		if (std::regex_search(sourceStr, match, re))
+		{
+			channel = fmt::sprintf("script:%s:nui", ToNarrow(match[1].str()));
+			sourceStr = fmt::sprintf(L"@%s/%s", match[1].str(), match[2].str());
+		}
+	}
+
+	console::Printf(channel, "%s\n", ToNarrow(fmt::sprintf(L"%s (%s:%d)", messageStr, sourceStr, line)));
 
 	return false;
 }
@@ -145,10 +232,16 @@ auto NUIClient::OnBeforeResourceLoad(CefRefPtr<CefBrowser> browser, CefRefPtr<Ce
 	{
 		std::string url = request->GetURL().ToString();
 
-		if (std::regex_search(url, reg))
+		try
 		{
-			trace("Blocked a request for blacklisted URI %s\n", url);
-			return RV_CANCEL;
+			if (std::regex_search(url, reg))
+			{
+				trace("Blocked a request for blacklisted URI %s\n", url);
+				return RV_CANCEL;
+			}
+		}
+		catch (std::exception& e)
+		{
 		}
 	}
 
@@ -187,6 +280,7 @@ void NUIClient::OnAudioCategoryConfigure(const std::string& frame, const std::st
 	}
 }
 
+#if 0
 void NUIClient::OnAudioStreamStarted(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, int audio_stream_id, int channels, ChannelLayout channel_layout, int sample_rate, int frames_per_buffer)
 {
 	if (g_audioSink)
@@ -257,17 +351,29 @@ void NUIClient::OnAudioStreamStopped(CefRefPtr<CefBrowser> browser, CefRefPtr<Ce
 
 	m_audioStreams.erase({ browser->GetIdentifier(), audio_stream_id });
 }
+#endif
 
 extern bool g_shouldCreateRootWindow;
 
+#ifdef USE_NUI_ROOTLESS
+extern std::set<std::string> g_recreateBrowsers;
+extern std::shared_mutex g_recreateBrowsersMutex;
+#endif
+
 void NUIClient::OnRenderProcessTerminated(CefRefPtr<CefBrowser> browser, TerminationStatus status)
 {
+#ifndef USE_NUI_ROOTLESS
 	if (browser->GetMainFrame()->GetURL() == "nui://game/ui/root.html")
 	{
 		browser->GetHost()->CloseBrowser(true);
 
 		g_shouldCreateRootWindow = true;
 	}
+#else
+	std::unique_lock<std::shared_mutex> _(g_recreateBrowsersMutex);
+
+	g_recreateBrowsers.insert(m_window->GetName());
+#endif
 }
 
 void NUIClient::OnBeforeClose(CefRefPtr<CefBrowser> browser)
@@ -298,14 +404,6 @@ CefRefPtr<CefLoadHandler> NUIClient::GetLoadHandler()
 CefRefPtr<CefRequestHandler> NUIClient::GetRequestHandler()
 {
 	return this;
-}
-
-CefRefPtr<CefAudioHandler> NUIClient::GetAudioHandler()
-{
-	// #TODONUI: render process termination does not work this way, needs an owning reference to the browser
-	// or otherwise tracking why the browser doesn't become null when playing audio and killing the render process
-	return nullptr;
-	//return this;
 }
 
 CefRefPtr<CefRenderHandler> NUIClient::GetRenderHandler()

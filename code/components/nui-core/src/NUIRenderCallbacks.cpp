@@ -7,19 +7,41 @@ extern nui::GameInterface* g_nuiGi;
 #include "memdbgon.h"
 
 extern bool g_hasCursor;
+extern bool g_shouldHideCursor;
 extern POINT g_cursorPos;
 
 extern bool g_isDragging;
 
-extern nui::GITexture* g_cursorTexture;
+extern fwRefContainer<nui::GITexture> g_cursorTexture;
+extern fwEvent<std::chrono::microseconds, std::chrono::microseconds> OnVSync;
+
+#ifdef USE_NUI_ROOTLESS
+extern std::shared_mutex g_nuiFocusStackMutex;
+extern std::list<std::string> g_nuiFocusStack;
+#endif
 
 static HookFunction initFunction([] ()
 {
+#ifndef IS_RDR3
+	OnVSync.Connect([](std::chrono::microseconds, std::chrono::microseconds)
+	{
+		Instance<NUIWindowManager>::Get()->ForAllWindows([=](fwRefContainer<NUIWindow> window)
+		{
+			if (window->GetPaintType() != NUIPaintTypePostRender)
+			{
+				return;
+			}
+
+			window->SendBeginFrame();
+		});
+	});
+#endif
+
 	g_nuiGi->OnRender.Connect([]()
 	{
 		if (nui::HasMainUI())
 		{
-			nui::GiveFocus(true);
+			nui::GiveFocus("mpMenu", true);
 		}
 
 		nui::OnDrawBackground(nui::HasMainUI());
@@ -29,14 +51,41 @@ static HookFunction initFunction([] ()
 			window->UpdateFrame();
 		});
 
-		Instance<NUIWindowManager>::Get()->ForAllWindows([=](fwRefContainer<NUIWindow> window)
+		std::map<std::string, fwRefContainer<NUIWindow>> renderWindows;
+
+		Instance<NUIWindowManager>::Get()->ForAllWindows([&renderWindows](fwRefContainer<NUIWindow> window)
 		{
 			if (window->GetPaintType() != NUIPaintTypePostRender)
 			{
 				return;
 			}
 
-			if (window->GetTexture())
+			renderWindows.insert({ window->GetName(), window });
+		});
+
+		std::list<std::string> windowOrder =
+#ifndef USE_NUI_ROOTLESS
+		{
+			"root"
+		}
+#else
+		g_nuiFocusStack
+#endif
+		;
+
+		// show on top = render last
+		std::reverse(windowOrder.begin(), windowOrder.end());
+
+		for (const auto& windowName : windowOrder)
+		{
+			auto& window = renderWindows[windowName];
+
+			if (!window.GetRef())
+			{
+				continue;
+			}
+
+			if (window->GetTexture().GetRef())
 			{
 				g_nuiGi->SetTexture(window->GetTexture(), true);
 
@@ -52,7 +101,7 @@ static HookFunction initFunction([] ()
 				g_nuiGi->UnsetTexture();
 			}
 
-			if (window->GetPopupTexture())
+			if (window->GetPopupTexture().GetRef())
 			{
 				g_nuiGi->SetTexture(window->GetPopupTexture(), true);
 
@@ -68,16 +117,16 @@ static HookFunction initFunction([] ()
 
 				g_nuiGi->UnsetTexture();
 			}
-		});
+		}
 
-		if (nui::HasMainUI() || g_hasCursor)
+		if ((nui::HasMainUI() || g_hasCursor) && !g_shouldHideCursor)
 		{
 			POINT cursorPos = g_cursorPos;
 
 			GetCursorPos(&cursorPos);
 			ScreenToClient(g_nuiGi->GetHWND(), &cursorPos);
 
-			if (g_cursorTexture)
+			if (g_cursorTexture.GetRef())
 			{
 				g_nuiGi->SetTexture(g_cursorTexture);
 

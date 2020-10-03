@@ -8,6 +8,8 @@
 #include "StdInc.h"
 #include "CitizenGame.h"
 
+#include <CL2LaunchMode.h>
+
 #include <io.h>
 #include <fcntl.h>
 
@@ -15,10 +17,15 @@
 #include <HostSharedData.h>
 
 #include <array>
+#include <optional>
 
 #include <shellscalingapi.h>
 
+#include <CrossBuildRuntime.h>
+
 #include <shobjidl.h>
+
+#include <CfxLocale.h>
 
 extern "C" BOOL WINAPI _CRT_INIT(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpReserved);
 
@@ -37,14 +44,56 @@ extern "C" int wmainCRTStartup();
 
 void DoPreLaunchTasks();
 void NVSP_DisableOnStartup();
+void SteamInput_Initialize();
 bool ExecutablePreload_Init();
 void InitLogging();
+
+#include <MinMode.h>
+#include <fstream>
+
+std::shared_ptr<fx::MinModeManifest> InitMinMode()
+{
+	const wchar_t* cli = GetCommandLineW();
+
+	auto minmodePos = wcsstr(cli, L"+set minmodemanifest \"");
+
+	try
+	{
+		if (minmodePos != nullptr)
+		{
+			std::wstring fileName = &minmodePos[wcslen(L"+set minmodemanifest \"")];
+			auto fnEnd = fileName.find_first_of('"');
+
+			if (fnEnd != std::string::npos)
+			{
+				fileName = fileName.substr(0, fnEnd);
+
+				std::ifstream fs(fileName);
+
+				nlohmann::json j;
+				fs >> j;
+
+				return std::make_shared<fx::MinModeManifest>(j);
+			}
+		}
+	}
+	catch (std::exception& e)
+	{
+
+	}
+
+	return std::make_shared<fx::MinModeManifest>();
+}
 
 HANDLE g_uiDoneEvent;
 HANDLE g_uiExitEvent;
 
-int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow)
+bool IsUnsafeGraphicsLibrary();
+
+int RealMain()
 {
+	//SetEnvironmentVariableW(L"CitizenFX_ToolMode", L"1");
+
 	bool toolMode = false;
 
 	if (getenv("CitizenFX_ToolMode"))
@@ -54,11 +103,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
 	if (!toolMode)
 	{
+#ifdef LAUNCHER_PERSONALITY_MAIN
 		// bootstrap the game
 		if (Bootstrap_RunInit())
 		{
 			return 0;
 		}
+#endif
 	}
 
 #if 0
@@ -105,6 +156,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
 	SetDllDirectory(MakeRelativeCitPath(L"bin").c_str()); // to prevent a) current directory DLL search being disabled and b) xlive.dll being taken from system if not overridden
 
+	wchar_t initCwd[1024];
+	GetCurrentDirectoryW(std::size(initCwd), initCwd);
+
 	if (!toolMode)
 	{
 		SetCurrentDirectory(MakeRelativeCitPath(L"").c_str());
@@ -120,12 +174,18 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 		setDefaultDllDirectories = nullptr;
 	}
 
-	if (addDllDirectory && setDefaultDllDirectories)
+	auto addDllDirs = [&]()
 	{
-		setDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS | LOAD_LIBRARY_SEARCH_USER_DIRS);
-		addDllDirectory(MakeRelativeCitPath(L"").c_str());
-		addDllDirectory(MakeRelativeCitPath(L"bin").c_str());
-	}
+		if (addDllDirectory && setDefaultDllDirectories)
+		{
+			setDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS | LOAD_LIBRARY_SEARCH_USER_DIRS);
+			addDllDirectory(MakeRelativeCitPath(L"").c_str());
+			addDllDirectory(MakeRelativeCitPath(L"bin").c_str());
+		}
+	};
+
+	// add DLL directories pre-installer
+	addDllDirs();
 
 	// determine dev mode and do updating
 	wchar_t exeName[512];
@@ -135,12 +195,16 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 	exeBaseName[0] = L'\0';
 	exeBaseName++;
 
+#ifdef LAUNCHER_PERSONALITY_MAIN
 	bool devMode = toolMode;
 
 	if (GetFileAttributes(va(L"%s.formaldev", exeBaseName)) != INVALID_FILE_ATTRIBUTES)
 	{
 		devMode = true;
 	}
+#else
+	bool devMode = true;
+#endif
 
 	// don't allow running a subprocess executable directly
 	if (MakeRelativeCitPath(L"").find(L"cache\\subprocess") != std::string::npos)
@@ -152,10 +216,31 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 	{
 		auto regPath = MakeRelativeCitPath(L"");
 
-		RegSetKeyValueW(HKEY_CURRENT_USER, L"SOFTWARE\\CitizenFX\\FiveM", L"Last Run Location", REG_SZ, regPath.c_str(), (regPath.size() + 1) * 2);
+		RegSetKeyValueW(HKEY_CURRENT_USER, L"SOFTWARE\\CitizenFX\\" PRODUCT_NAME, L"Last Run Location", REG_SZ, regPath.c_str(), (regPath.size() + 1) * 2);
 	}
 
-	SetCurrentProcessExplicitAppUserModelID(L"CitizenFX.FiveM.Client");
+	SetCurrentProcessExplicitAppUserModelID(L"CitizenFX." PRODUCT_NAME L".Client");
+
+	// toggle wait for switch
+	if (wcsstr(GetCommandLineW(), L"-switchcl"))
+	{
+		// if this isn't a subprocess
+		wchar_t fxApplicationName[MAX_PATH];
+		GetModuleFileName(GetModuleHandle(nullptr), fxApplicationName, _countof(fxApplicationName));
+
+		if (wcsstr(fxApplicationName, L"subprocess") == nullptr)
+		{
+			static HostSharedData<CfxState> initStateOld("CfxInitState");
+
+			HANDLE hProcess = OpenProcess(SYNCHRONIZE, FALSE, initStateOld->initialGamePid);
+
+			if (hProcess)
+			{
+				WaitForSingleObject(hProcess, INFINITE);
+				CloseHandle(hProcess);
+			}
+		}
+	}
 
 	static HostSharedData<CfxState> initState("CfxInitState");
 
@@ -185,6 +270,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 		}
 	}
 
+#ifdef LAUNCHER_PERSONALITY_MAIN
 	// if not the master process, force devmode
 	if (!devMode)
 	{
@@ -206,6 +292,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 			return 0;
 		}
 	}
+#endif
+
+	// add DLL directories post-installer (in case we moved into a Product.app directory)
+	addDllDirs();
 
 	if (InitializeExceptionHandler())
 	{
@@ -214,23 +304,30 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
 	InitLogging();
 
-	// load global dinput8.dll over any that might exist in the game directory
+	auto loadSystemDll = [](auto dll)
 	{
 		wchar_t systemPath[512];
 		GetSystemDirectory(systemPath, _countof(systemPath));
 
-		wcscat_s(systemPath, L"\\dinput8.dll");
+		wcscat_s(systemPath, dll);
 
 		LoadLibrary(systemPath);
+	};
+
+	// load some popular DLLs over the system-wide variants
+	auto systemDlls = {
+		// common ASI loaders
+		L"\\dinput8.dll",
+		L"\\dsound.dll", // breaks DSound init in game code
+
+		// packed DLL commonly shipping with RDR mods
+		L"\\version.dll"
+	};
+
+	for (auto dll : systemDlls)
+	{
+		loadSystemDll(dll);
 	}
-
-	LoadLibrary(MakeRelativeCitPath(L"dinput8.dll").c_str());
-	LoadLibrary(MakeRelativeCitPath(L"steam_api64.dll").c_str());
-
-	// laod V8 DLLs in case end users have these in a 'weird' directory
-	LoadLibrary(MakeRelativeCitPath(L"v8_libplatform.dll").c_str());
-	LoadLibrary(MakeRelativeCitPath(L"v8_libbase.dll").c_str());
-	LoadLibrary(MakeRelativeCitPath(L"v8.dll").c_str());
 
 	// assign us to a job object
 	if (initState->IsMasterProcess())
@@ -261,7 +358,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 				if (AssignProcessToJobObject(hJob, GetCurrentProcess()))
 				{
 					JOBOBJECT_EXTENDED_LIMIT_INFORMATION info = {};
-					info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+					info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
 					if (SetInformationJobObject(hJob, JobObjectExtendedLimitInformation, &info, sizeof(info)))
 					{
 						initState->inJobObject = true;
@@ -304,6 +401,27 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 	{
 		return *gamePathExit;
 	}
+
+	// don't load anything resembling ReShade *at all* until the game is loading(!)
+	loadSystemDll(L"\\dxgi.dll");
+
+	// don't load d3d11.dll from game dir for subprocesses or invalid cases
+	if ((!initState->IsMasterProcess() && !initState->IsGameProcess()) || IsUnsafeGraphicsLibrary())
+	{
+		loadSystemDll(L"\\d3d11.dll");
+	}
+
+	LoadLibrary(MakeRelativeCitPath(L"dinput8.dll").c_str());
+	LoadLibrary(MakeRelativeCitPath(L"steam_api64.dll").c_str());
+
+#ifndef LAUNCHER_PERSONALITY_CHROME
+	// laod V8 DLLs in case end users have these in a 'weird' directory
+	LoadLibrary(MakeRelativeCitPath(L"bin/icuuc.dll").c_str());
+	LoadLibrary(MakeRelativeCitPath(L"bin/icui18n.dll").c_str());
+	LoadLibrary(MakeRelativeCitPath(L"v8_libplatform.dll").c_str());
+	LoadLibrary(MakeRelativeCitPath(L"v8_libbase.dll").c_str());
+	LoadLibrary(MakeRelativeCitPath(L"v8.dll").c_str());
+#endif
 
 	if (addDllDirectory)
 	{
@@ -354,8 +472,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
 				if (showOSWarning)
 				{
-					MessageBox(nullptr, L"You are currently using an outdated version of Windows. This may lead to issues using the FiveM client. Please update to Windows 10 version 1703 (\"Creators Update\") or higher in case you are experiencing "
-						L"any issues. The game will continue to start now.", L"FiveM", MB_OK | MB_ICONWARNING);
+					MessageBox(nullptr, fmt::sprintf(gettext(L"You are currently using an outdated version of Windows. This may lead to issues using the %s client. Please update to Windows 10 version 1703 (\"Creators Update\") or higher in case you are experiencing "
+															 L"any issues. The game will continue to start now."),
+										PRODUCT_NAME).c_str(),
+					PRODUCT_NAME, MB_OK | MB_ICONWARNING);
 				}
 			}
 
@@ -372,18 +492,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 					{
 						if (elevationData == TokenElevationTypeFull)
 						{
-							const wchar_t* elevationComplaint = L"FiveM does not support running under elevated privileges. Please change your Windows settings to not run FiveM as administrator.\nThat won't fix anything. The game will exit now.";
-
-							auto result = MessageBox(nullptr, elevationComplaint, L"FiveM", MB_ABORTRETRYIGNORE | MB_ICONERROR);
-
-							if (result == IDIGNORE)
-							{
-								MessageBox(nullptr, L"No, you can't ignore this. The game will exit now.", L"FiveM", MB_OK | MB_ICONINFORMATION);
-							}
-							else if (result == IDRETRY)
-							{
-								MessageBox(nullptr, elevationComplaint, L"FiveM", MB_OK | MB_ICONWARNING);
-							}
+							const wchar_t* elevationComplaint = va(gettext(L"FiveM does not support running under elevated privileges. Please change your Windows settings to not run FiveM as administrator.\nThe game will exit now."));
+							MessageBox(nullptr, elevationComplaint, L"FiveM", MB_OK | MB_ICONERROR);
 
 							return 0;
 						}
@@ -401,7 +511,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 				{
 					if (GetLastError() == ERROR_ACCESS_DENIED)
 					{
-						MessageBox(nullptr, L"FiveM could not create a file in the folder it is placed in. Please move your installation out of Program Files or another protected folder.", L"Error", MB_OK | MB_ICONSTOP);
+						MessageBoxW(nullptr, va(gettext(L"%s could not create a file in the folder it is placed in. Please move your installation out of Program Files or another protected folder."), PRODUCT_NAME), L"Error", MB_OK | MB_ICONSTOP);
 						return 0;
 					}
 				}
@@ -413,14 +523,26 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 		}
 	}
 
-	NVSP_DisableOnStartup();
+	if (initState->IsMasterProcess())
+	{
+#ifdef LAUNCHER_PERSONALITY_MAIN
+		NVSP_DisableOnStartup();
+		SteamInput_Initialize();
+#endif
+
+		GetModuleFileNameW(NULL, initState->gameExePath, std::size(initState->gameExePath));
+	}
 
 	// readd the game path into the PATH
 	newPath = MakeRelativeCitPath(L"bin\\crt") + L";" + MakeRelativeCitPath(L"bin") + L";" + MakeRelativeCitPath(L"") + L";" + MakeRelativeGamePath(L"") + L"; " + std::wstring(pathBuf);
 
 	SetEnvironmentVariable(L"PATH", newPath.c_str());
 
-	if (!toolMode)
+	if (launch::IsSDK())
+	{
+		SetCurrentDirectory(initCwd);
+	}
+	else if (!toolMode)
 	{
 		SetCurrentDirectory(MakeRelativeGamePath(L"").c_str());
 	}
@@ -433,20 +555,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 	// check stuff regarding the game executable
 	std::wstring gameExecutable = MakeRelativeGamePath(GAME_EXECUTABLE);
 
-#ifndef IS_LAUNCHER
-	if (GetFileAttributes(gameExecutable.c_str()) == INVALID_FILE_ATTRIBUTES)
-	{
-		MessageBox(nullptr, L"Could not find the game executable (" GAME_EXECUTABLE L") at the configured path. Please check your CitizenFX.ini file.", PRODUCT_NAME, MB_OK | MB_ICONERROR);
-		return 0;
-	}
-#endif
-
-#ifdef GTA_FIVE
+#if defined(GTA_FIVE) || defined(IS_RDR3)
 	if (!ExecutablePreload_Init())
 	{
 		return 0;
 	}
 
+#if defined(LAUNCHER_PERSONALITY_GAME) || defined(LAUNCHER_PERSONALITY_MAIN)
 	// ensure game cache is up-to-date, and obtain redirection metadata from the game cache
 	std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>, wchar_t> converter;
 	auto redirectionData = UpdateGameCache();
@@ -458,6 +573,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
 	g_redirectionData = redirectionData;
 
+#ifdef GTA_FIVE
 	gameExecutable = converter.from_bytes(redirectionData["GTA5.exe"]);
 
 	{
@@ -476,9 +592,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
 				VS_FIXEDFILEINFO* fixedInfo = reinterpret_cast<VS_FIXEDFILEINFO*>(fixedInfoBuffer);
 				
-				if ((fixedInfo->dwFileVersionLS >> 16) != 1604)
+				if ((fixedInfo->dwFileVersionLS >> 16) != (Is372() ? 372 : ((Is2060()) ? 2060 : 1604)))
 				{
-					MessageBox(nullptr, va(L"The found GTA executable (%s) has version %d.%d.%d.%d, but only 1.0.1604.0 is currently supported. Please obtain this version, and try again.",
+					MessageBox(nullptr, va(L"The found GTA executable (%s) has version %d.%d.%d.%d, but only 1.0.372.2/1.0.1604.0/1.0.2060.0 is currently supported. Please obtain this version, and try again.",
 										   gameExecutable.c_str(),
 										   (fixedInfo->dwFileVersionMS >> 16),
 										   (fixedInfo->dwFileVersionMS & 0xFFFF),
@@ -491,18 +607,25 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 		}
 	}
 #endif
+#endif
+#endif
 
+#ifdef LAUNCHER_PERSONALITY_MAIN
 	tui = {};
+#endif
 
-	g_uiExitEvent = CreateEvent(NULL, FALSE, FALSE, L"CitizenFX_PreUIExit");
-	g_uiDoneEvent = CreateEvent(NULL, FALSE, FALSE, L"CitizenFX_PreUIDone");
+	auto minModeManifest = InitMinMode();
 
-	if (initState->IsMasterProcess() && !toolMode)
+	g_uiExitEvent = CreateEvent(NULL, FALSE, FALSE, va(L"CitizenFX_PreUIExit%s", IsCL2() ? L"CL2" : L""));
+	g_uiDoneEvent = CreateEvent(NULL, FALSE, FALSE, va(L"CitizenFX_PreUIDone%s", IsCL2() ? L"CL2" : L""));
+
+	if (initState->IsMasterProcess() && !toolMode && !launch::IsSDK())
 	{
-		std::thread([/*tui = std::move(tui)*/]() mutable
+		std::thread([/*tui = std::move(tui)*/minModeManifest]() mutable
 		{
 			static HostSharedData<CfxState> initState("CfxInitState");
 
+#ifndef _DEBUG
 			if (!initState->isReverseGame)
 			{
 				//auto tuiTen = std::move(tui);
@@ -512,8 +635,17 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 				UI_DoCreation(false);
 
 				auto st = GetTickCount64();
-				UI_UpdateText(0, L"Starting FiveM...");
-				UI_UpdateText(1, L"We're getting there.");
+				UI_UpdateText(0, va(L"Starting %s...", 
+					ToWide(minModeManifest->Get("productName", ToNarrow(PRODUCT_NAME)))));
+
+				if (wcsstr(GetCommandLineW(), L"-switchcl"))
+				{
+					UI_UpdateText(1, va(gettext(L"Transitioning to another build...")));
+				}
+				else
+				{
+					UI_UpdateText(1, ToWide(minModeManifest->Get("productSubtitle", gettext("We're getting there."))).c_str());
+				}
 
 				while (GetTickCount64() < (st + 3500))
 				{
@@ -541,22 +673,48 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
 				UI_DoDestruction();
 			}
+#endif
 
 			SetEvent(g_uiDoneEvent);
 		}).detach();
 	}
 
+	if (launch::IsSDKGuest())
+	{
+		SetEvent(g_uiDoneEvent);
+	}
+
 	if (!toolMode)
 	{
+		CitizenGame::SetMinModeManifest(minModeManifest->GetRaw());
+
 		wchar_t fxApplicationName[MAX_PATH];
 		GetModuleFileName(GetModuleHandle(nullptr), fxApplicationName, _countof(fxApplicationName));
+
+		if (launch::IsSDK() && initState->IsMasterProcess())
+		{
+			// run game mode
+			HMODULE coreRT = LoadLibrary(MakeRelativeCitPath(L"CoreRT.dll").c_str());
+
+			if (coreRT)
+			{
+				auto gameProc = (void (*)())GetProcAddress(coreRT, "GameMode_RunSDK");
+
+				if (gameProc)
+				{
+					gameProc();
+				}
+			}
+
+			return 0;
+		}
 
 #ifdef IS_LAUNCHER
 		// is this the game runtime subprocess?
 		if (wcsstr(fxApplicationName, L"GameRuntime") != nullptr)
 		{
 #else
-		if (initState->IsMasterProcess())
+		if (initState->IsMasterProcess() || wcsstr(fxApplicationName, L"GameRuntime") != nullptr)
 		{
 #endif
 #ifdef _DEBUG
@@ -642,6 +800,16 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 	}
 
 	return 0;
+}
+
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow)
+{
+	return RealMain();
+}
+
+int main()
+{
+	return RealMain();
 }
 
 extern "C" __declspec(dllexport) DWORD NvOptimusEnablement = 1;

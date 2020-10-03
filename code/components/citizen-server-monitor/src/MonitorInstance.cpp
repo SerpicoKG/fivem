@@ -10,6 +10,8 @@
 #include <MonitorInstance.h>
 #include <ServerInstanceBaseRef.h>
 
+#include <KeyedRateLimiter.h>
+
 #include <console/OptionTokenizer.h>
 #include <boost/filesystem.hpp>
 
@@ -29,8 +31,42 @@
 #include <TcpListenManager.h>
 #include <HttpServerManager.h>
 
+#include <cfx_version.h>
+
 #include <skyr/url.hpp>
 #include <skyr/percent_encode.hpp>
+
+#ifdef _WIN32
+#include <MinHook.h>
+
+static void(WINAPI* g_origExitProcess)(DWORD exitCode);
+
+static void WINAPI ExitProcessHook(DWORD exitCode)
+{
+	auto consoleWindow = GetConsoleWindow();
+	DWORD pid;
+
+	GetWindowThreadProcessId(consoleWindow, &pid);
+	if (pid == GetCurrentProcessId())
+	{
+		printf("\n\nExited. Press any key to continue.\n");
+		auto _ = getc(stdin);
+		(void)_;
+	}
+
+	g_origExitProcess(exitCode);
+}
+
+void InitializeExitHook()
+{
+	MH_Initialize();
+	MH_CreateHookApi(L"kernelbase.dll", "ExitProcess", ExitProcessHook, (void**)&g_origExitProcess);
+	MH_CreateHookApi(L"kernel32.dll", "ExitProcess", ExitProcessHook, NULL);
+	MH_EnableHook(MH_ALL_HOOKS);
+}
+#else
+void InitializeExitHook() {}
+#endif
 
 class LocalResourceMounter : public fx::ResourceMounter
 {
@@ -66,7 +102,11 @@ public:
 #endif
 
 				resource = m_manager->CreateResource(fragRef);
-				resource->LoadFrom(*skyr::percent_decode(pr));
+				if (!resource->LoadFrom(*skyr::percent_decode(pr)))
+				{
+					m_manager->RemoveResource(resource);
+					resource = nullptr;
+				}
 			}
 		}
 
@@ -81,6 +121,8 @@ inline std::string ToNarrow(const std::string& str)
 {
 	return str;
 }
+
+fwEvent<fx::MonitorInstance*> OnMonitorTick;
 
 namespace fx
 {
@@ -106,6 +148,8 @@ namespace fx
 
 	void MonitorInstance::Run()
 	{
+		InitializeExitHook();
+
 		auto execCommand = AddCommand("exec", [=](const std::string& path) {
 			fwRefContainer<vfs::Stream> stream = vfs::OpenRead(path);
 
@@ -136,6 +180,7 @@ namespace fx
 		std::shared_ptr<ConVar<std::string>> rootVar;
 
 		auto monitorVar = AddVariable<bool>("monitorMode", ConVar_None, true);
+		auto versionVar = AddVariable<std::string>("version", ConVar_None, "FXServer-" GIT_DESCRIPTION);
 
 		{
 			se::ScopedPrincipal principalScope(se::Principal{ "system.console" });
@@ -172,13 +217,6 @@ namespace fx
 				consoleCtx->ExecuteSingleCommandDirect(bit);
 			}
 
-			trace(R"(
-^3--------------------------------------------
-FXServerMonitor is watching over the servers
---------------------------------------------^7
-
-)");
-
 			// execute config
 			consoleCtx->ExecuteSingleCommandDirect(ProgramArguments{ "exec", "monitor_autoexec.cfg" });
 		}
@@ -196,8 +234,9 @@ FXServerMonitor is watching over the servers
 	void MonitorInstance::Initialize()
 	{
 		// initialize early components
-		SetComponent(new fx::TcpListenManager());
+		SetComponent(new fx::TcpListenManager("svMain"));
 		SetComponent(new fx::HttpServerManager());
+		SetComponent(new fx::PeerAddressRateLimiterStore(GetComponent<console::Context>().GetRef()));
 
 		// grant Se access
 		seGetCurrentContext()->AddAccessControlEntry(se::Principal{ "resource.monitor" }, se::Object{ "command" }, se::AccessType::Allow);
@@ -231,7 +270,8 @@ FXServerMonitor is watching over the servers
 			return resourceManager->AddResource(url.href()).get();
 		};
 
-		addResource("webadmin")->Start();
+		// monitor does not use webadmin currently
+		//addResource("webadmin")->Start();
 		addResource("monitor")->Start();
 
 		// setup ticks
@@ -240,8 +280,11 @@ FXServerMonitor is watching over the servers
 		auto loop = GetComponent<fx::TcpListenManager>()->GetTcpStack()->GetWrapLoop();
 		m_tickTimer = loop->resource<uvw::TimerHandle>();
 
-		m_tickTimer->on<uvw::TimerEvent>([resourceManager](const uvw::TimerEvent& ev, uvw::TimerHandle& timer)
+		m_tickTimer->on<uvw::TimerEvent>([this, resourceManager](const uvw::TimerEvent& ev, uvw::TimerHandle& timer)
 		{
+			OnMonitorTick(this);
+
+			resourceManager->MakeCurrent();
 			resourceManager->Tick();
 		});
 

@@ -251,24 +251,24 @@ PeerAddress TLSServerStream::GetPeerAddress()
 	return m_baseStream->GetPeerAddress();
 }
 
-void TLSServerStream::Write(const std::string& data)
+void TLSServerStream::Write(const std::string& data, TCompleteCallback&& onComplete)
 {
-	DoWrite<decltype(data)>(data);
+	DoWrite<decltype(data)>(data, std::move(onComplete));
 }
 
-void TLSServerStream::Write(const std::vector<uint8_t>& data)
+void TLSServerStream::Write(const std::vector<uint8_t>& data, TCompleteCallback&& onComplete)
 {
-	DoWrite<decltype(data)>(data);
+	DoWrite<decltype(data)>(data, std::move(onComplete));
 }
 
-void TLSServerStream::Write(std::string&& data)
+void TLSServerStream::Write(std::string&& data, TCompleteCallback&& onComplete)
 {
-	DoWrite<decltype(data)>(std::move(data));
+	DoWrite<decltype(data)>(std::move(data), std::move(onComplete));
 }
 
-void TLSServerStream::Write(std::vector<uint8_t>&& data)
+void TLSServerStream::Write(std::vector<uint8_t>&& data, TCompleteCallback&& onComplete)
 {
-	DoWrite<decltype(data)>(std::move(data));
+	DoWrite<decltype(data)>(std::move(data), std::move(onComplete));
 }
 
 void TLSServerStream::Close()
@@ -292,16 +292,21 @@ void TLSServerStream::Close()
 #endif
 			}
 		}
-	});
+	}, true);
 }
 
 void TLSServerStream::WriteToClient(const uint8_t buf[], size_t length)
 {
-	std::vector<uint8_t> data(buf, buf + length);
+	auto dataPtr = std::unique_ptr<char[]>(new char[length]);
+	memcpy(dataPtr.get(), buf, length);
 	
 	if (m_baseStream.GetRef())
 	{
-		m_baseStream->Write(data);
+		m_baseStream->Write(std::move(dataPtr), length, std::move(m_nextOnComplete));
+	}
+	else
+	{
+		m_nextOnComplete = {};
 	}
 }
 
@@ -378,11 +383,11 @@ void TLSServerStream::CloseInternal()
 	m_parentServer->CloseStream(this);
 }
 
-void TLSServerStream::ScheduleCallback(const TScheduledCallback& callback)
+void TLSServerStream::ScheduleCallback(TScheduledCallback&& callback, bool performInline)
 {
 	if (m_baseStream.GetRef())
 	{
-		m_baseStream->ScheduleCallback(callback);
+		m_baseStream->ScheduleCallback(std::move(callback), performInline);
 	}
 }
 
@@ -405,6 +410,7 @@ void TLSServer::Initialize(fwRefContainer<TcpServer> baseServer, std::shared_ptr
 		fwRefContainer<TLSServerStream> childStream = new TLSServerStream(this, stream);
 		childStream->Initialize();
 
+		std::lock_guard<std::mutex> _(m_connectionsMutex);
 		m_connections.insert(childStream);
 	});
 }

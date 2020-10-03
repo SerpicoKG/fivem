@@ -3,8 +3,40 @@
 
 #include <Hooking.h>
 
-// 1604 now...!
-#define TRIGGER_EP 0x14175DE00
+#include <CrossBuildRuntime.h>
+
+#ifdef GTA_FIVE
+// 1604
+// 1868 now...!
+// 2060 realities
+#define TRIGGER_EP (Is372() ? 0x141623FC8 : ((Is2060()) ? 0x141796A34 : 0x14175DE00))
+#elif defined(IS_RDR3)
+// 1207.58
+//#define TRIGGER_EP 0x142D55C2C
+
+// 1207.69
+//#define TRIGGER_EP 0x142D5B8FC
+
+// 1207.77
+//#define TRIGGER_EP 0x142D5F80C
+
+// 1207.80
+//#define TRIGGER_EP 0x142D601AC
+
+// 1311.12
+//#define TRIGGER_EP 0x142E0E63C
+
+// 1311.14
+//#define TRIGGER_EP 0x142E0F9BC
+
+// 1311.16
+#define TRIGGER_EP 0x142E0EF1C
+
+// 1311.20
+#define TRIGGER_EP 0x142E0F92C
+#else
+#define TRIGGER_EP 0xDECEA5ED
+#endif
 
 // on NT pre-6.3 (or 6.2, even), VEHs can't modify debug registers
 // making a new thread for every single block is a bad idea as well, but perf isn't _that_ bad

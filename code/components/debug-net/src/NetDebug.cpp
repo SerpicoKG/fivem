@@ -11,7 +11,6 @@
 #include "NetLibrary.h"
 #include "FontRenderer.h"
 #include "DrawCommands.h"
-#include "Screen.h"
 #include <CoreConsole.h>
 #include <mmsystem.h>
 
@@ -20,10 +19,12 @@
 #include <imgui.h>
 #include <imguivariouscontrols.h>
 
+extern DLL_IMPORT fwEvent<int, int> OnPushNetMetrics;
+
 const int g_netOverlayOffsetX = -30;
 const int g_netOverlayOffsetY = -60;
 const int g_netOverlayWidth = 400;
-const int g_netOverlayHeight = 300;
+const int g_netOverlayHeight = 320;
 
 const int g_netOverlaySampleSize = 200; // milliseconds per sample frame
 const int g_netOverlaySampleCount = 150;
@@ -103,6 +104,8 @@ public:
 
 	virtual void OnRouteDelayResult(int msec) override;
 
+	virtual void OnPacketLossResult(int plPercent) override;
+
 	virtual void OnIncomingCommand(uint32_t type, size_t size, bool reliable) override;
 
 	virtual void OnOutgoingCommand(uint32_t type, size_t size, bool reliable) override;
@@ -139,6 +142,8 @@ private:
 	int m_inRouteDelaySampleArchive;
 	int m_inRouteDelaySamplesArchive[2000];
 
+	int m_packetLoss;
+
 	bool m_enabled;
 
 	bool m_enabledCommands;
@@ -163,12 +168,23 @@ private:
 
 	std::map<uint32_t, size_t> m_lastOutgoingMetrics;
 
+	std::vector<std::tuple<uint32_t, size_t>> m_lastIncomingData;
+
+	std::vector<std::tuple<uint32_t, size_t>> m_lastOutgoingData;
+
+	std::vector<std::tuple<uint32_t, size_t>> m_incomingData;
+
+	std::vector<std::tuple<uint32_t, size_t>> m_outgoingData;
+
 private:
 	inline int GetOverlayLeft()
 	{
+		int x, y;
+		GetGameResolution(x, y);
+
 		if (g_netOverlayOffsetX < 0)
 		{
-			return GetScreenResolutionX() + g_netOverlayOffsetX - g_netOverlayWidth;
+			return x + g_netOverlayOffsetX - g_netOverlayWidth;
 		}
 		else
 		{
@@ -178,9 +194,12 @@ private:
 
 	inline int GetOverlayTop()
 	{
+		int x, y;
+		GetGameResolution(x, y);
+
 		if (g_netOverlayOffsetY < 0)
 		{
-			return GetScreenResolutionY() + g_netOverlayOffsetY - g_netOverlayHeight;
+			return y + g_netOverlayOffsetY - g_netOverlayHeight;
 		}
 		else
 		{
@@ -203,6 +222,7 @@ NetOverlayMetricSink::NetOverlayMetricSink()
 	  m_inBytes(0), m_inPackets(0), m_outBytes(0), m_outPackets(0),
 	  m_inRoutePackets(0), m_lastInRoutePackets(0), m_outRoutePackets(0), m_lastOutRoutePackets(0),
 	  m_inRouteDelay(0), m_inRouteDelaySample(0), m_inRouteDelayMax(0), m_inRouteDelaySampleArchive(0),
+	  m_packetLoss(0),
 	  m_enabled(false), m_enabledCommands(false)
 {
 	memset(m_inRouteDelaySamples, 0, sizeof(m_inRouteDelaySamples));
@@ -265,6 +285,7 @@ NetOverlayMetricSink::NetOverlayMetricSink()
 
 				static bool showIncoming = true;
 				static bool showOutgoing = true;
+				static bool showLog = true;
 
 				auto showList = [](const decltype(m_lastIncomingMetrics)& list, const decltype(m_incomingReliable)& reliable)
 				{
@@ -293,6 +314,38 @@ NetOverlayMetricSink::NetOverlayMetricSink()
 				if (ImGui::CollapsingHeader("Outgoing", &showOutgoing))
 				{
 					showList(m_lastOutgoingMetrics, m_outgoingReliable);
+				}
+
+				if (ImGui::CollapsingHeader("Log", &showLog))
+				{
+					ImGui::Columns(2);
+
+					for (int i = 0; i < std::max(m_lastIncomingData.size(), m_lastOutgoingData.size()); i++)
+					{
+						if (i < m_lastIncomingData.size())
+						{
+							ImGui::Text("%d. %s (%d)", i + 1, g_hashes.LookupHash(std::get<0>(m_lastIncomingData[i])), std::get<1>(m_lastIncomingData[i]));
+						}
+						else
+						{
+							ImGui::Text("");
+						}
+
+						ImGui::NextColumn();
+
+						if (i < m_lastOutgoingData.size())
+						{
+							ImGui::Text("%d. %s (%d)", i + 1, g_hashes.LookupHash(std::get<0>(m_lastOutgoingData[i])), std::get<1>(m_lastOutgoingData[i]));
+						}
+						else
+						{
+							ImGui::Text("");
+						}
+
+						ImGui::NextColumn();
+					}
+
+					ImGui::Columns(1);
 				}
 			}
 
@@ -334,6 +387,11 @@ void NetOverlayMetricSink::OnPingResult(int msec)
 	m_ping = msec;
 }
 
+void NetOverlayMetricSink::OnPacketLossResult(int plPercent)
+{
+	m_packetLoss = plPercent;
+}
+
 void NetOverlayMetricSink::OnRouteDelayResult(int msec)
 {
 	// quick samples
@@ -363,6 +421,7 @@ void NetOverlayMetricSink::OnIncomingCommand(uint32_t type, size_t size, bool re
 	std::unique_lock<std::mutex> lock(m_metricMutex);
 	m_incomingMetrics[type] += size;
 	m_incomingReliable[type] = reliable;
+	m_incomingData.push_back({ type, size });
 }
 
 void NetOverlayMetricSink::OnOutgoingCommand(uint32_t type, size_t size, bool reliable)
@@ -370,6 +429,7 @@ void NetOverlayMetricSink::OnOutgoingCommand(uint32_t type, size_t size, bool re
 	std::unique_lock<std::mutex> lock(m_metricMutex);
 	m_outgoingMetrics[type] += size;
 	m_outgoingReliable[type] = reliable;
+	m_outgoingData.push_back({ type, size });
 }
 
 // log data if enabled
@@ -428,6 +488,9 @@ void NetOverlayMetricSink::UpdateMetrics()
 
 			m_lastIncomingMetrics = std::move(m_incomingMetrics);
 			m_lastOutgoingMetrics = std::move(m_outgoingMetrics);
+
+			m_lastIncomingData = std::move(m_incomingData);
+			m_lastOutgoingData = std::move(m_outgoingData);
 		}
 
 		// log output?
@@ -466,6 +529,8 @@ void NetOverlayMetricSink::UpdateMetrics()
 				timeGetTime() - netLogInitTime, m_ping, m_lastInBytes, m_lastInPackets, m_lastOutBytes, m_lastOutPackets, m_lastInRoutePackets, m_lastOutRoutePackets));
 		}
 	}
+
+	OnPushNetMetrics(m_ping, m_packetLoss);
 }
 
 void NetOverlayMetricSink::DrawGraph()

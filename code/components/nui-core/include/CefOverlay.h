@@ -7,27 +7,36 @@
 
 #pragma once
 
+//#define USE_NUI_ROOTLESS
+
 #ifdef COMPILING_NUI_CORE
 #define OVERLAY_DECL __declspec(dllexport)
 #else
 #define OVERLAY_DECL __declspec(dllimport)
 #endif
 
+#if defined(COMPILING_NUI_CORE) || defined(COMPILING_NUI_RESOURCES) || defined(COMPILING_GLUE)
+#define WANT_CEF_INTERNALS
+#endif
+
 #include <d3d11.h>
 
 #include <memory>
 
-#include "RGBA.h"
-#include "Rect.h"
+#ifdef WANT_CEF_INTERNALS
+#include "CfxRGBA.h"
+#include "CfxRect.h"
 
 #include <include/cef_app.h>
 #include <include/cef_browser.h>
 #include <include/cef_client.h>
+#endif
 
 #include <SharedInput.h>
 
 #include <queue>
 
+#ifdef WANT_CEF_INTERNALS
 class NUIExtensionHandler : public CefV8Handler
 {
 public:
@@ -46,9 +55,20 @@ private:
 
 	IMPLEMENT_REFCOUNTING(NUIExtensionHandler);
 };
+#endif
+
+#ifndef COMPILING_NUI_CORE
+class NUIWindow : public fwRefCountable
+{
+
+};
+#else
+class NUIWindow;
+#endif
 
 namespace nui
 {
+#ifdef WANT_CEF_INTERNALS
 	struct GILockedTexture
 	{
 		int level;
@@ -69,7 +89,7 @@ namespace nui
 		NoOverwrite = 16
 	};
 
-	class OVERLAY_DECL GITexture
+	class OVERLAY_DECL GITexture : public fwRefCountable
 	{
 	public:
 		virtual ~GITexture() = default;
@@ -94,18 +114,23 @@ namespace nui
 		CRGBA color;
 	};
 
-	class GameInterface
+	class OVERLAY_DECL GameInterface
 	{
 	public:
 		virtual void GetGameResolution(int* width, int* height) = 0;
 
-		virtual GITexture* CreateTexture(int width, int height, GITextureFormat format, void* pixelData) = 0;
+		virtual fwRefContainer<GITexture> CreateTexture(int width, int height, GITextureFormat format, void* pixelData) = 0;
 
-		virtual GITexture* CreateTextureBacking(int width, int height, GITextureFormat format) = 0;
+		virtual fwRefContainer<GITexture> CreateTextureBacking(int width, int height, GITextureFormat format) = 0;
 
-		virtual GITexture* CreateTextureFromShareHandle(HANDLE shareHandle) = 0;
+		virtual fwRefContainer<GITexture> CreateTextureFromShareHandle(HANDLE shareHandle) = 0;
 
-		virtual void SetTexture(GITexture* texture, bool pm = false) = 0;
+		virtual fwRefContainer<GITexture> CreateTextureFromShareHandle(HANDLE shareHandle, int width, int height)
+		{
+			return CreateTextureFromShareHandle(shareHandle);
+		}
+
+		virtual void SetTexture(fwRefContainer<GITexture> texture, bool pm = false) = 0;
 
 		virtual void DrawRectangles(int numRectangles, const ResultingRectangle* rectangles) = 0;
 
@@ -115,13 +140,13 @@ namespace nui
 
 		virtual HWND GetHWND() = 0;
 
-		virtual void BlitTexture(GITexture* dst, GITexture* src) = 0;
+		virtual void BlitTexture(fwRefContainer<GITexture> dst, fwRefContainer<GITexture> src) = 0;
 
 		virtual ID3D11Device* GetD3D11Device() = 0;
 
 		virtual ID3D11DeviceContext* GetD3D11DeviceContext() = 0;
 
-		virtual GITexture* CreateTextureFromD3D11Texture(ID3D11Texture2D* texture) = 0;
+		virtual fwRefContainer<GITexture> CreateTextureFromD3D11Texture(ID3D11Texture2D* texture) = 0;
 
 		fwEvent<HWND, UINT, WPARAM, LPARAM, bool&, LRESULT&> OnWndProc;
 
@@ -137,6 +162,7 @@ namespace nui
 	};
 
 	void OVERLAY_DECL Initialize(nui::GameInterface* gi);
+#endif
 
 	enum class CefChannelLayout
 	{
@@ -261,7 +287,7 @@ namespace nui
 	public:
 		virtual ~IAudioStream() = default;
 
-		virtual void ProcessPacket(const float** data, int frames, int64 pts) = 0;
+		virtual void ProcessPacket(const float** data, int frames, int64_t pts) = 0;
 	};
 
 	class IAudioSink
@@ -273,37 +299,54 @@ namespace nui
 	//void EnterV8Context(const char* type);
 	//void LeaveV8Context(const char* type);
 	//void InvokeNUICallback(const char* type, const CefString& name, const CefV8ValueList& arguments);
+#ifndef USE_NUI_ROOTLESS
 	void OVERLAY_DECL ReloadNUI();
+#endif
 
 	void OVERLAY_DECL CreateFrame(fwString frameName, fwString frameURL);
+	void OVERLAY_DECL PrepareFrame(fwString frameName, fwString frameURL);
 	void OVERLAY_DECL DestroyFrame(fwString frameName);
 	bool OVERLAY_DECL HasFrame(const std::string& frameName);
 	void OVERLAY_DECL SignalPoll(fwString frameName);
 
-	void OVERLAY_DECL GiveFocus(bool hasFocus, bool hasCursor = false);
+	void OVERLAY_DECL GiveFocus(const std::string& frameName, bool hasFocus, bool hasCursor = false);
 	void OVERLAY_DECL OverrideFocus(bool hasFocus);
+	void OVERLAY_DECL KeepInput(bool keepInput);
 	bool OVERLAY_DECL HasMainUI();
 	void OVERLAY_DECL SetMainUI(bool enable);
+	void OVERLAY_DECL SetHideCursor(bool hide);
 
 	void ProcessInput();
 
+#ifndef USE_NUI_ROOTLESS
 	void OVERLAY_DECL ExecuteRootScript(const std::string& scriptBit);
+#endif
 
 	void OVERLAY_DECL PostFrameMessage(const std::string& frameName, const std::string& jsonData);
 
+#ifndef USE_NUI_ROOTLESS
 	void OVERLAY_DECL PostRootMessage(const std::string& jsonData);
+#endif
 
+#ifdef WANT_CEF_INTERNALS
+#ifndef USE_NUI_ROOTLESS
 	OVERLAY_DECL CefBrowser* GetBrowser();
+#endif
+
+	OVERLAY_DECL CefBrowser* GetFocusBrowser();
 
 	// window API
 	OVERLAY_DECL CefBrowser* GetNUIWindowBrowser(fwString windowName);
+#endif
 
-	OVERLAY_DECL void CreateNUIWindow(fwString windowName, int width, int height, fwString windowURL);
+	OVERLAY_DECL fwRefContainer<NUIWindow> CreateNUIWindow(fwString windowName, int width, int height, fwString windowURL, bool rawBlit = false);
 	OVERLAY_DECL void DestroyNUIWindow(fwString windowName);
 	OVERLAY_DECL void ExecuteWindowScript(const std::string& windowName, const std::string& scriptBit);
 	OVERLAY_DECL void SetNUIWindowURL(fwString windowName, fwString url);
 
-	OVERLAY_DECL GITexture* GetWindowTexture(fwString windowName);
+#ifdef WANT_CEF_INTERNALS
+	OVERLAY_DECL fwRefContainer<GITexture> GetWindowTexture(fwString windowName);
+#endif
 
 	extern
 		OVERLAY_DECL
@@ -314,6 +357,10 @@ namespace nui
 		fwEvent<bool> OnDrawBackground;
 
 	OVERLAY_DECL void SetAudioSink(IAudioSink* sinkRef);
+
+	using TResourceLookupFn = std::function<std::string(const std::string&)>;
+
+	OVERLAY_DECL void SetResourceLookupFunction(const TResourceLookupFn& fn);
 }
 
 #define REQUIRE_IO_THREAD()   assert(CefCurrentlyOn(TID_IO));
@@ -326,6 +373,8 @@ struct nui_s
 	DWORD nuiHeight;
 };
 
+#ifdef WANT_CEF_INTERNALS
 extern
 	OVERLAY_DECL
 	fwEvent<const char*, CefRefPtr<CefRequest>, CefRefPtr<CefResourceHandler>&> OnSchemeCreateRequest;
+#endif

@@ -8,7 +8,7 @@
 #include "StdInc.h"
 #include <ResourceCache.h>
 
-#include <SHA1.h>
+#include <openssl/sha.h>
 #include <VFSManager.h>
 
 #include <msgpack.hpp>
@@ -119,23 +119,21 @@ void ResourceCache::AddEntry(const std::string& localFileName, const std::map<st
 	{
 		// calculate a hash of the file
 		std::vector<uint8_t> data(8192);
-		sha1nfo sha1;
+		SHA_CTX sha1;
 		size_t numRead;
 
 		// initialize context
-		sha1_init(&sha1);
+		SHA1_Init(&sha1);
 
 		// read from the stream
 		while ((numRead = stream->Read(data)) > 0)
 		{
-			sha1_write(&sha1, reinterpret_cast<char*>(&data[0]), numRead);
+			SHA1_Update(&sha1, reinterpret_cast<char*>(&data[0]), numRead);
 		}
 
 		// get the hash result and convert it to a string
-		uint8_t* hash = sha1_result(&sha1);
-
 		std::array<uint8_t, 20> h;
-		memcpy(h.data(), hash, 20);
+		SHA1_Final(h.data(), &sha1);
 
 		stream = {};
 
@@ -190,9 +188,9 @@ void ResourceCache::AddEntry(const std::string& localFileName, const std::array<
 	{
 		// add an entry to the database
 		std::string key = "cache:v1:" + std::string(reinterpret_cast<const char*>(hash.data()), 20);
-		m_entryCache[key] = {};
 
 		m_indexDatabase->Put(options, key, leveldb::Slice(buffer.data(), buffer.size()));
+		m_entryCache[key] = {};
 	}
 
 	{
@@ -200,9 +198,9 @@ void ResourceCache::AddEntry(const std::string& localFileName, const std::array<
 		auto fromIt = metaData.find("from");
 
 		std::string key = "cache:v1:url:" + fromIt->second;
-		m_entryCache[key] = {};
 
 		m_indexDatabase->Put(options, key, leveldb::Slice(buffer.data(), buffer.size()));
+		m_entryCache[key] = {};
 	}
 
 	trace("ResourceCache::AddEntry: Saved cache:v1:%s to the index cache.\n", hashString);

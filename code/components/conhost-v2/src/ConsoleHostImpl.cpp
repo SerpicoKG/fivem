@@ -29,6 +29,8 @@
 
 #include <imgui.h>
 
+#include <ShlObj.h>
+
 static bool g_conHostInitialized = false;
 extern bool g_consoleFlag;
 int g_scrollTop;
@@ -38,14 +40,7 @@ int g_bufferHeight;
 static uint32_t g_pointSamplerState;
 static rage::grcTexture* g_fontTexture;
 
-struct DrawList
-{
-	ImVector<ImDrawVert> VtxBuffer;
-	ImVector<ImDrawIdx> IdxBuffer;
-	ImVector<ImDrawCmd> CmdBuffer;
-};
-
-static void RenderDrawListInternal(DrawList* drawList)
+static void RenderDrawListInternal(ImDrawList* drawList)
 {
 	auto oldRasterizerState = GetRasterizerState();
 	SetRasterizerState(GetStockStateIdentifier(RasterizerStateNoCulling));
@@ -70,28 +65,38 @@ static void RenderDrawListInternal(DrawList* drawList)
 
 			PushDrawBlitImShader();
 
-			rage::grcBegin(3, cmd.ElemCount);
-
-			for (int i = 0; i < cmd.ElemCount; i++)
+			for (int s = 0; s < cmd.ElemCount; s += 2046)
 			{
-				auto& vertex = drawList->VtxBuffer.Data[drawList->IdxBuffer.Data[i + idxOff]];
-				auto color = vertex.col;
+				int c = std::min(cmd.ElemCount - s, uint32_t(2046));
+				rage::grcBegin(3, c);
 
-				rage::grcVertex(vertex.pos.x, vertex.pos.y, 0.0f, 0.0f, 0.0f, -1.0f, color, vertex.uv.x, vertex.uv.y);
+				//trace("imgui draw %d tris\n", cmd.ElemCount);
+
+				for (int i = 0; i < c; i++)
+				{
+					auto& vertex = drawList->VtxBuffer.Data[drawList->IdxBuffer.Data[i + idxOff]];
+					auto color = vertex.col;
+
+					rage::grcVertex(vertex.pos.x, vertex.pos.y, 0.0f, 0.0f, 0.0f, -1.0f, color, vertex.uv.x, vertex.uv.y);
+				}
+
+				idxOff += c;
+
+#if defined(GTA_FIVE)
+				// set scissor rects here, as they might be overwritten by a matrix push
+				D3D11_RECT scissorRect;
+				scissorRect.left = cmd.ClipRect.x;
+				scissorRect.top = cmd.ClipRect.y;
+				scissorRect.right = cmd.ClipRect.z;
+				scissorRect.bottom = cmd.ClipRect.w;
+
+				GetD3D11DeviceContext()->RSSetScissorRects(1, &scissorRect);
+#else
+				SetScissorRect(cmd.ClipRect.x, cmd.ClipRect.y, cmd.ClipRect.z, cmd.ClipRect.w);
+#endif
+
+				rage::grcEnd();
 			}
-
-			idxOff += cmd.ElemCount;
-
-			// set scissor rects here, as they might be overwritten by a matrix push
-			D3D11_RECT scissorRect;
-			scissorRect.left = cmd.ClipRect.x;
-			scissorRect.top = cmd.ClipRect.y;
-			scissorRect.right = cmd.ClipRect.z;
-			scissorRect.bottom = cmd.ClipRect.w;
-
-			GetD3D11DeviceContext()->RSSetScissorRects(1, &scissorRect);
-
-			rage::grcEnd();
 
 			PopDrawBlitImShader();
 		}
@@ -105,6 +110,7 @@ static void RenderDrawListInternal(DrawList* drawList)
 
 	delete drawList;
 
+#if defined(GTA_FIVE)
 	{
 		D3D11_RECT scissorRect;
 		scissorRect.left = 0.0f;
@@ -114,6 +120,9 @@ static void RenderDrawListInternal(DrawList* drawList)
 
 		GetD3D11DeviceContext()->RSSetScissorRects(1, &scissorRect);
 	}
+#else
+	SetScissorRect(0, 0, 0x1FFF, 0x1FFF);
+#endif
 }
 
 static void RenderDrawLists(ImDrawData* drawData)
@@ -126,11 +135,7 @@ static void RenderDrawLists(ImDrawData* drawData)
 	for (int i = 0; i < drawData->CmdListsCount; i++)
 	{
 		ImDrawList* drawList = drawData->CmdLists[i];
-		
-		DrawList* grDrawList = new DrawList();
-		grDrawList->CmdBuffer.swap(drawList->CmdBuffer);
-		grDrawList->IdxBuffer.swap(drawList->IdxBuffer);
-		grDrawList->VtxBuffer.swap(drawList->VtxBuffer);
+		ImDrawList* grDrawList = drawList->CloneOutput();
 
 		if (IsOnRenderThread())
 		{
@@ -142,8 +147,9 @@ static void RenderDrawLists(ImDrawData* drawData)
 
 			EnqueueGenericDrawCommand([](uintptr_t a, uintptr_t b)
 			{
-				RenderDrawListInternal((DrawList*)a);
-			}, &argRef, &argRef);
+				RenderDrawListInternal((ImDrawList*)a);
+			},
+			&argRef, &argRef);
 		}
 	}
 }
@@ -167,7 +173,7 @@ static void CreateFontTexture()
 	rage::grcTexture* texture = rage::grcTextureFactory::getInstance()->createImage(&reference, nullptr);
 	g_fontTexture = texture;
 
-	io.Fonts->TexID = (void *)g_fontTexture;
+	io.Fonts->TexID = (void*)g_fontTexture;
 }
 #else
 DLL_EXPORT fwEvent<ImDrawData*> OnRenderImDrawData;
@@ -186,6 +192,8 @@ static void RenderDrawLists(ImDrawData* drawData)
 void DrawConsole();
 
 static std::mutex g_conHostMutex;
+
+void DrawMiniConsole();
 
 DLL_EXPORT void OnConsoleFrameDraw(int width, int height)
 {
@@ -236,6 +244,8 @@ DLL_EXPORT void OnConsoleFrameDraw(int width, int height)
 		DrawConsole();
 	}
 
+	DrawMiniConsole();
+
 	ConHost::OnDrawGui();
 
 	ImGui::Render();
@@ -261,58 +271,58 @@ static void OnConsoleWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam, 
 	ImGuiIO& io = ImGui::GetIO();
 	switch (msg)
 	{
-	case WM_LBUTTONDOWN:
-		io.MouseDown[0] = true;
-		pass = false;
-		break;
-	case WM_LBUTTONUP:
-		io.MouseDown[0] = false;
-		pass = false;
-		break;
-	case WM_RBUTTONDOWN:
-		io.MouseDown[1] = true;
-		pass = false;
-		break;
-	case WM_RBUTTONUP:
-		io.MouseDown[1] = false;
-		pass = false;
-		break;
-	case WM_MBUTTONDOWN:
-		io.MouseDown[2] = true;
-		pass = false;
-		break;
-	case WM_MBUTTONUP:
-		io.MouseDown[2] = false;
-		pass = false;
-		break;
-	case WM_MOUSEWHEEL:
-		io.MouseWheel += GET_WHEEL_DELTA_WPARAM(wParam) > 0 ? +1.0f : -1.0f;
-		pass = false;
-		break;
-	case WM_MOUSEMOVE:
-		io.MousePos.x = (signed short)(lParam);
-		io.MousePos.y = (signed short)(lParam >> 16);
-		pass = false;
-		break;
-	case WM_KEYDOWN:
-		if (wParam < 256)
-			io.KeysDown[wParam] = 1;
-		pass = false;
-		break;
-	case WM_KEYUP:
-		if (wParam < 256)
-			io.KeysDown[wParam] = 0;
-		pass = false;
-		break;
-	case WM_CHAR:
-		// You can also use ToAscii()+GetKeyboardState() to retrieve characters.
-		if (wParam > 0 && wParam < 0x10000)
-			io.AddInputCharacter((unsigned short)wParam);
-		pass = false;
-		break;
-	case WM_INPUT:
-		pass = false;
-		break;
+		case WM_LBUTTONDOWN:
+			io.MouseDown[0] = true;
+			pass = false;
+			break;
+		case WM_LBUTTONUP:
+			io.MouseDown[0] = false;
+			pass = false;
+			break;
+		case WM_RBUTTONDOWN:
+			io.MouseDown[1] = true;
+			pass = false;
+			break;
+		case WM_RBUTTONUP:
+			io.MouseDown[1] = false;
+			pass = false;
+			break;
+		case WM_MBUTTONDOWN:
+			io.MouseDown[2] = true;
+			pass = false;
+			break;
+		case WM_MBUTTONUP:
+			io.MouseDown[2] = false;
+			pass = false;
+			break;
+		case WM_MOUSEWHEEL:
+			io.MouseWheel += GET_WHEEL_DELTA_WPARAM(wParam) > 0 ? +1.0f : -1.0f;
+			pass = false;
+			break;
+		case WM_MOUSEMOVE:
+			io.MousePos.x = (signed short)(lParam);
+			io.MousePos.y = (signed short)(lParam >> 16);
+			pass = false;
+			break;
+		case WM_KEYDOWN:
+			if (wParam < 256)
+				io.KeysDown[wParam] = 1;
+			pass = false;
+			break;
+		case WM_KEYUP:
+			if (wParam < 256)
+				io.KeysDown[wParam] = 0;
+			pass = false;
+			break;
+		case WM_CHAR:
+			// You can also use ToAscii()+GetKeyboardState() to retrieve characters.
+			if (wParam > 0 && wParam < 0x10000)
+				io.AddInputCharacter((unsigned short)wParam);
+			pass = false;
+			break;
+		case WM_INPUT:
+			pass = false;
+			break;
 	}
 
 	if (!pass)
@@ -329,13 +339,16 @@ DLL_EXPORT void RunConsoleWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPa
 	OnConsoleWndProc(hWnd, msg, wParam, lParam, pass, result);
 }
 
+ImFont* consoleFontSmall;
+ImFont* consoleFontTiny;
+
 static InitFunction initFunction([]()
 {
 	auto cxt = ImGui::CreateContext();
 	ImGui::SetCurrentContext(cxt);
 
 	ImGuiIO& io = ImGui::GetIO();
-	io.KeyMap[ImGuiKey_Tab] = VK_TAB;                       // Keyboard mapping. ImGui will use those indices to peek into the io.KeyDown[] array that we will update during the application lifetime.
+	io.KeyMap[ImGuiKey_Tab] = VK_TAB; // Keyboard mapping. ImGui will use those indices to peek into the io.KeyDown[] array that we will update during the application lifetime.
 	io.KeyMap[ImGuiKey_LeftArrow] = VK_LEFT;
 	io.KeyMap[ImGuiKey_RightArrow] = VK_RIGHT;
 	io.KeyMap[ImGuiKey_UpArrow] = VK_UP;
@@ -361,9 +374,34 @@ static InitFunction initFunction([]()
 
 	io.BackendFlags |= ImGuiBackendFlags_HasMouseCursors;
 
-	static std::string imguiIni = ToNarrow(MakeRelativeCitPath(L"citizen/imgui.ini"));
+	static std::string imguiIni = ([]
+	{
+		std::wstring outPath = MakeRelativeCitPath(L"citizen/imgui.ini");
+
+		PWSTR appDataPath;
+		if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &appDataPath)))
+		{
+			// create the directory if not existent
+			std::wstring cfxPath = std::wstring(appDataPath) + L"\\CitizenFX";
+			CreateDirectory(cfxPath.c_str(), nullptr);
+
+			std::wstring profilePath = cfxPath + L"\\imgui.ini";
+
+			if (GetFileAttributes(profilePath.c_str()) == INVALID_FILE_ATTRIBUTES && GetFileAttributes(outPath.c_str()) != INVALID_FILE_ATTRIBUTES)
+			{
+				CopyFile(outPath.c_str(), profilePath.c_str(), FALSE);
+			}
+
+			CoTaskMemFree(appDataPath);
+
+			outPath = profilePath;
+		}
+
+		return ToNarrow(outPath);
+	})();
+
 	io.IniFilename = const_cast<char*>(imguiIni.c_str());
-	io.RenderDrawListsFn = RenderDrawLists;  // Alternatively you can set this to NULL and call ImGui::GetDrawData() after ImGui::Render() to get the same ImDrawData pointer.
+	io.RenderDrawListsFn = RenderDrawLists; // Alternatively you can set this to NULL and call ImGui::GetDrawData() after ImGui::Render() to get the same ImDrawData pointer.
 	//io.ImeWindowHandle = g_hWnd;
 
 	ImGuiStyle& style = ImGui::GetStyle();
@@ -402,18 +440,25 @@ static InitFunction initFunction([]()
 			fread(&fontData[0], 1, fontSize, font);
 			fclose(font);
 
-			io.Fonts->AddFontFromMemoryTTF(fontData, fontSize, 20.0f);
+			io.Fonts->AddFontFromMemoryTTF(fontData, fontSize, 22.0f);
+
+			consoleFontSmall = io.Fonts->AddFontFromMemoryTTF(fontData, fontSize, 18.0f);
+			consoleFontTiny = io.Fonts->AddFontFromMemoryTTF(fontData, fontSize, 14.0f);
 		}
 	}
 
 #ifndef IS_LAUNCHER
 	OnGrcCreateDevice.Connect([=]()
 	{
+#ifndef IS_RDR3
 		D3D11_SAMPLER_DESC samplerDesc = CD3D11_SAMPLER_DESC(CD3D11_DEFAULT());
 		samplerDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
 		samplerDesc.MaxAnisotropy = 0;
 
 		g_pointSamplerState = CreateSamplerState(&samplerDesc);
+#else
+		g_pointSamplerState = GetStockStateIdentifier(SamplerStatePoint);
+#endif
 	});
 
 	InputHook::QueryInputTarget.Connect([](std::vector<InputTarget*>& targets)
@@ -501,6 +546,14 @@ static InitFunction initFunction([]()
 		OnConsoleWndProc(hWnd, msg, wParam, lParam, pass, lresult);
 	});
 
+	InputHook::QueryMayLockCursor.Connect([](int& may)
+	{
+		if (g_consoleFlag)
+		{
+			may = 0;
+		}
+	});
+
 	OnPostFrontendRender.Connect([]()
 	{
 		int width, height;
@@ -518,11 +571,16 @@ struct ConsoleKeyEvent
 	ConsoleModifiers modifiers;
 };
 
-void SendPrintMessage(const std::string& message);
+void SendPrintMessage(const std::string& channel, const std::string& message);
 
-void ConHost::Print(int channel, const std::string& message)
+bool ConHost::IsConsoleOpen()
 {
-	SendPrintMessage(message);
+	return g_consoleFlag;
+}
+
+void ConHost::Print(const std::string& channel, const std::string& message)
+{
+	SendPrintMessage(channel, message);
 }
 
 fwEvent<const char*, const char*> ConHost::OnInvokeNative;

@@ -41,6 +41,8 @@ public:
 private:
 	void ProcessPacket(const uint8_t* data, size_t size, NetPacketMetrics& metrics, ENetPacketFlag flags);
 
+	void SendPacketQueue();
+
 private:
 	std::string m_connectData;
 
@@ -52,8 +54,6 @@ private:
 
 	bool m_timedOut;
 
-	std::shared_ptr<ConVar<int>> m_maxPackets;
-
 	uint32_t m_lastKeepaliveSent;
 };
 
@@ -63,9 +63,6 @@ static std::shared_ptr<ConVar<int>> g_maxMtuVar;
 NetLibraryImplV2::NetLibraryImplV2(INetLibraryInherit* base)
 	: m_base(base), m_host(nullptr), m_timedOut(false), m_serverPeer(nullptr), m_lastKeepaliveSent(0)
 {
-	m_maxPackets = std::make_shared<ConVar<int>>("net_maxPackets", ConVar_Archive, 50);
-	m_maxPackets->GetHelper()->SetConstraints(1, 200);
-
 	CreateResources();
 
 	Reset();
@@ -113,13 +110,13 @@ void NetLibraryImplV2::CreateResources()
 
 void NetLibraryImplV2::SendReliableCommand(uint32_t type, const char* buffer, size_t length)
 {
-	NetBuffer msg(131072);
+	net::Buffer msg;
 	msg.Write(type);
 	msg.Write(buffer, length);
 
 	if (!m_timedOut && m_serverPeer)
 	{
-		ENetPacket* packet = enet_packet_create(msg.GetBuffer(), msg.GetCurLength(), ENET_PACKET_FLAG_RELIABLE);
+		ENetPacket* packet = enet_packet_create(msg.GetBuffer(), msg.GetCurOffset(), ENET_PACKET_FLAG_RELIABLE);
 
 		enet_peer_send(m_serverPeer, 0, packet);
 	}
@@ -129,13 +126,13 @@ void NetLibraryImplV2::SendReliableCommand(uint32_t type, const char* buffer, si
 
 void NetLibraryImplV2::SendUnreliableCommand(uint32_t type, const char* buffer, size_t length)
 {
-	NetBuffer msg(131072);
+	net::Buffer msg;
 	msg.Write(type);
 	msg.Write(buffer, length);
 
 	if (!m_timedOut && m_serverPeer)
 	{
-		ENetPacket* packet = enet_packet_create(msg.GetBuffer(), msg.GetCurLength(), (ENetPacketFlag)0);
+		ENetPacket* packet = enet_packet_create(msg.GetBuffer(), msg.GetCurOffset(), (ENetPacketFlag)0);
 
 		enet_peer_send(m_serverPeer, 0, packet);
 	}
@@ -192,11 +189,11 @@ void NetLibraryImplV2::RunFrame()
 		{
 		case ENET_EVENT_TYPE_CONNECT:
 		{
-			NetBuffer buf(1300);
+			net::Buffer buf(1300);
 			buf.Write<int>(1);
 			buf.Write(m_connectData.c_str(), m_connectData.size());
 
-			ENetPacket* packet = enet_packet_create(buf.GetBuffer(), buf.GetCurLength(), ENET_PACKET_FLAG_RELIABLE);
+			ENetPacket* packet = enet_packet_create(buf.GetBuffer(), buf.GetCurOffset(), ENET_PACKET_FLAG_RELIABLE);
 			enet_peer_send(event.peer, 0, packet);
 			break;
 		}
@@ -232,33 +229,34 @@ void NetLibraryImplV2::RunFrame()
 
 		while (m_base->GetOutgoingPacket(packet))
 		{
-			NetBuffer msg(1300);
-			msg.Write(0xE938445B); // msgRoute
+			net::Buffer msg(1300);
+			msg.Write(HashRageString("msgRoute"));
 			msg.Write(packet.netID);
 			msg.Write<uint16_t>(packet.payload.size());
 
-			//trace("sending msgRoute to %d len %d\n", packet.netID, packet.payload.size());
-
 			msg.Write(packet.payload.c_str(), packet.payload.size());
 
-			enet_peer_send(m_serverPeer, 1, enet_packet_create(msg.GetBuffer(), msg.GetCurLength(), ENET_PACKET_FLAG_UNSEQUENCED));
+			enet_peer_send(m_serverPeer, 1, enet_packet_create(msg.GetBuffer(), msg.GetCurOffset(), (ENetPacketFlag)0));
 
-			m_base->GetMetricSink()->OnOutgoingCommand(0xE938445B, packet.payload.size() + 4, false);
+			m_base->GetMetricSink()->OnOutgoingCommand(HashRageString("msgRoute"), packet.payload.size() + 4, false);
 			m_base->GetMetricSink()->OnOutgoingRoutePackets(1);
 		}
 
-		if ((timeGetTime() - m_lastKeepaliveSent) > static_cast<uint32_t>(1000 / m_maxPackets->GetValue()))
+		// send keepalive every 100ms (server requires an actual received packet in order to call fx::Client::Touch)
+		if ((timeGetTime() - m_lastKeepaliveSent) > 100)
 		{
-			NetBuffer msg(1300);
+			net::Buffer msg(8);
 			msg.Write(0xCA569E63); // msgEnd
 
-			enet_peer_send(m_serverPeer, 1, enet_packet_create(msg.GetBuffer(), msg.GetCurLength(), ENET_PACKET_FLAG_UNSEQUENCED));
+			enet_peer_send(m_serverPeer, 1, enet_packet_create(msg.GetBuffer(), msg.GetCurOffset(), ENET_PACKET_FLAG_UNSEQUENCED));
 
 			m_lastKeepaliveSent = timeGetTime();
 		}
 
 		// update ping metrics
 		m_base->GetMetricSink()->OnPingResult(m_serverPeer->lastRoundTripTime);
+
+		m_base->GetMetricSink()->OnPacketLossResult((m_serverPeer->packetLoss / (double)ENET_PEER_PACKET_LOSS_SCALE) * 100);
 
 		// update received metrics
 		if (m_host->totalReceivedData != 0)
@@ -318,13 +316,13 @@ void NetLibraryImplV2::SendConnect(const std::string& connectData)
 
 void NetLibraryImplV2::ProcessPacket(const uint8_t* data, size_t size, NetPacketMetrics& metrics, ENetPacketFlag flags)
 {
-	NetBuffer msg((char*)data, size);
+	net::Buffer msg(data, size);
 	uint32_t msgType = msg.Read<uint32_t>();
 
 	if (msgType == 1)
 	{
 		char dataCopy[8192];
-		memcpy(dataCopy, data, fwMin(size, sizeof(dataCopy)));
+		memcpy(dataCopy, data, std::min(size, sizeof(dataCopy)));
 		dataCopy[size] = '\0';
 
 		char* clientNetIDStr = &dataCopy[5];
@@ -384,9 +382,7 @@ void NetLibraryImplV2::ProcessPacket(const uint8_t* data, size_t size, NetPacket
 		uint16_t netID = msg.Read<uint16_t>();
 		uint16_t rlength = msg.Read<uint16_t>();
 
-		//trace("msgRoute from %d len %d\n", netID, rlength);
-
-		char routeBuffer[65536];
+		static char routeBuffer[65536];
 		if (!msg.Read(routeBuffer, rlength))
 		{
 			return;

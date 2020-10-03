@@ -7,6 +7,8 @@
 
 #include "StdInc.h"
 
+#pragma comment(lib, "comctl32.lib")
+
 #ifndef IS_FXSERVER
 #include "Hooking.Aux.h"
 #include <minhook.h>
@@ -14,7 +16,10 @@
 #ifdef _M_AMD64
 #pragma comment(lib, "ntdll.lib")
 
+#include <shlobj.h>
+
 #include <winternl.h>
+#include <commctrl.h>
 
 typedef wchar_t*(*MappingFunctionType)(const wchar_t*, void*(*)(size_t));
 
@@ -24,8 +29,28 @@ static NTSTATUS(*g_origLoadDll)(const wchar_t*, uint32_t*, UNICODE_STRING*, HAND
 
 static bool g_d3dx11;
 
+static std::wstring GetRoot(int folder)
+{
+	wchar_t pathRef[MAX_PATH];
+	if (FAILED(SHGetFolderPathW(NULL, folder, NULL, SHGFP_TYPE_CURRENT, pathRef)))
+	{
+		return L"C:\\dummy_path\\";
+	}
+
+	return pathRef;
+}
+
+static std::wstring g_documentsRoot = GetRoot(CSIDL_MYDOCUMENTS);
+static std::wstring g_localAppDataRoot = GetRoot(CSIDL_LOCAL_APPDATA);
+
+static std::wstring g_scDocumentsRoot = g_documentsRoot + L"\\Rockstar Games\\Social Club";
+static std::wstring g_launcherDocumentsRoot = g_documentsRoot + L"\\Rockstar Games\\Launcher";
+static std::wstring g_launcherAppDataRoot = g_localAppDataRoot + L"\\Rockstar Games\\Launcher";
+
 static std::wstring MapRedirectedFilename(const wchar_t* origFileName)
 {
+	//trace("map %s\n", ToNarrow(origFileName));
+
 	if (wcsstr(origFileName, L"autosignin.dat") != nullptr)
 	{
 		return MakeRelativeCitPath(L"cache\\game\\autosignin.dat");
@@ -56,6 +81,69 @@ static std::wstring MapRedirectedFilename(const wchar_t* origFileName)
 		return MakeRelativeCitPath(L"nodontfuckingplaygtav.exe");
 	}
 
+	if (wcsstr(origFileName, L"LauncherPatcher.exe") != nullptr)
+	{
+		return MakeRelativeCitPath(L"nodontfuckingplaygtav.exe");
+	}
+
+	if (wcsstr(origFileName, L"Data\\Rockstar Games\\Launcher") != nullptr)
+	{
+		return MakeRelativeCitPath(L"cache\\game\\ros_launcher_data2") + &wcsstr(origFileName, L"Games\\Launcher")[14];
+	}
+
+	if (wcsstr(origFileName, L"Local\\Rockstar Games\\Launcher") != nullptr || wcsstr(origFileName, g_launcherAppDataRoot.c_str()) != nullptr)
+	{
+		return MakeRelativeCitPath(L"cache\\game\\ros_launcher_appdata2") + &wcsstr(origFileName, L"Games\\Launcher")[14];
+	}
+
+	if (wcsstr(origFileName, L"Documents\\Rockstar Games\\Social Club") != nullptr || wcsstr(origFileName, g_scDocumentsRoot.c_str()) != nullptr)
+	{
+		return MakeRelativeCitPath(L"cache\\game\\ros_documents") + &wcsstr(origFileName, L"Games\\Social Club")[17];
+	}
+
+	if (wcsstr(origFileName, L"Documents\\Rockstar Games\\Launcher") != nullptr || wcsstr(origFileName, g_launcherDocumentsRoot.c_str()) != nullptr)
+	{
+		return MakeRelativeCitPath(L"cache\\game\\ros_launcher_documents") + &wcsstr(origFileName, L"Games\\Launcher")[14];
+	}
+
+	if (getenv("CitizenFX_ToolMode"))
+	{
+		if (wcsstr(origFileName, L"Rockstar Games\\Red Dead Redemption 2") != nullptr)
+		{
+			CreateDirectoryW(MakeRelativeCitPath(L"cache\\game\\ros_launcher_game2").c_str(), NULL);
+
+			static std::wstring s;
+			s = MakeRelativeCitPath(L"cache\\game\\ros_launcher_game2") + &wcsstr(origFileName, L"d Redemption 2")[14];
+			origFileName = s.c_str();
+		}
+		else if (wcsstr(origFileName, L"Rockstar Games\\Grand Theft Auto V") != nullptr)
+		{
+			CreateDirectoryW(MakeRelativeCitPath(L"cache\\game\\ros_launcher_game2").c_str(), NULL);
+
+			static std::wstring s;
+			s = MakeRelativeCitPath(L"cache\\game\\ros_launcher_game2") + &wcsstr(origFileName, L"d Theft Auto V")[14];
+			origFileName = s.c_str();
+		}
+		else if (wcsstr(origFileName, L"Rockstar Games\\index.bin") != nullptr) // lol
+		{
+			CreateDirectoryW(MakeRelativeCitPath(L"cache\\game\\ros_launcher_game2").c_str(), NULL);
+
+			static std::wstring s;
+			s = MakeRelativeCitPath(L"cache\\game\\ros_launcher_game2") + &wcsstr(origFileName, L"Rockstar Games")[14];
+			origFileName = s.c_str();
+		}
+		else if (wcsstr(origFileName, L"Rockstar Games\\GTA5.exe") != nullptr || wcsstr(origFileName, L"Rockstar Games\\RDR2.exe") != nullptr)
+		{
+			static std::wstring s;
+#ifdef GTA_FIVE
+			s = MakeRelativeGamePath(L"GTA5.exe");
+#else
+			s = MakeRelativeGamePath(L"RDR2.exe");
+#endif
+			origFileName = s.c_str();
+		}
+	}
+
 	wchar_t* fileName = g_mappingFunction(origFileName, malloc);
 
 	std::wstring retval(fileName);
@@ -81,6 +169,40 @@ static std::wstring MapRedirectedNtFilename(const wchar_t* origFileName)
 static bool IsMappedFilename(const std::wstring& fileName)
 {
 	if (fileName.find(L"Files\\Rockstar Games\\Social Club") != std::string::npos)
+	{
+		return true;
+	}
+
+	// hopefully this'll trap most `Program Files (x86)` directories
+	if (fileName.find(L"Files (x86)\\Rockstar Games\\Social Club") != std::string::npos)
+	{
+		return true;
+	}
+
+	if (fileName.find(L"Files\\Rockstar Games\\Launcher") != std::string::npos)
+	{
+		return true;
+	}
+
+	if (fileName.find(L"Data\\Rockstar Games\\Launcher") != std::string::npos)
+	{
+		return true;
+	}
+
+	if (fileName.find(L"Data\\Local\\Rockstar Games\\Launcher") != std::string::npos ||
+		fileName.find(g_launcherAppDataRoot) != std::string::npos)
+	{
+		return true;
+	}
+
+	if (fileName.find(L"Documents\\Rockstar Games\\Social Club") != std::string::npos ||
+		fileName.find(g_scDocumentsRoot) != std::string::npos)
+	{
+		return true;
+	}
+
+	if (fileName.find(L"Documents\\Rockstar Games\\Launcher") != std::string::npos ||
+		fileName.find(g_launcherDocumentsRoot) != std::string::npos)
 	{
 		return true;
 	}
@@ -110,9 +232,33 @@ static bool IsMappedFilename(const std::wstring& fileName)
 		return true;
 	}
 
-	if (fileName.length() > 10 && fileName.compare(fileName.length() - 8, 8, L"GTA5.exe") == 0)
+	if (wcsstr(fileName.c_str(), L"LauncherPatcher.exe") != nullptr)
 	{
 		return true;
+	}
+
+	if (getenv("CitizenFX_ToolMode"))
+	{
+		if (wcsstr(fileName.c_str(), L"Rockstar Games\\Red Dead Redemption 2") != nullptr)
+		{
+			return true;
+		}
+		else if (wcsstr(fileName.c_str(), L"Rockstar Games\\Grand Theft Auto V") != nullptr)
+		{
+			return true;
+		}
+		else if (wcsstr(fileName.c_str(), L"Rockstar Games\\index.bin") != nullptr)
+		{
+			return true;
+		}
+		else if (wcsstr(fileName.c_str(), L"Rockstar Games\\GTA5.exe") != nullptr)
+		{
+			return true;
+		}
+		else if (wcsstr(fileName.c_str(), L"Rockstar Games\\RDR2.exe") != nullptr)
+		{
+			return true;
+		}
 	}
 
 	return false;
@@ -125,6 +271,15 @@ static HANDLE CreateFileWStub(_In_ LPCWSTR lpFileName, _In_ DWORD dwDesiredAcces
 	std::wstring fileName = MapRedirectedFilename(lpFileName);
 
 	return g_origCreateFileW(fileName.c_str(), dwDesiredAccess, dwShareMode, lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
+}
+
+static BOOL(*g_origGetFileAttributesExW)(_In_ LPCWSTR lpFileName, _In_ GET_FILEEX_INFO_LEVELS fInfoLevelId, _Out_writes_bytes_(sizeof(WIN32_FILE_ATTRIBUTE_DATA)) LPVOID lpFileInformation);
+
+static BOOL GetFileAttributesExWStub(_In_ LPCWSTR lpFileName, _In_ GET_FILEEX_INFO_LEVELS fInfoLevelId, _Out_writes_bytes_(sizeof(WIN32_FILE_ATTRIBUTE_DATA)) LPVOID lpFileInformation)
+{
+	std::wstring fileName = MapRedirectedFilename(lpFileName);
+
+	return g_origGetFileAttributesExW(fileName.c_str(), fInfoLevelId, lpFileInformation);
 }
 
 NTSTATUS NTAPI LdrLoadDllStub(const wchar_t* fileName, uint32_t* flags, UNICODE_STRING* moduleName, HANDLE* handle)
@@ -146,8 +301,6 @@ NTSTATUS NTAPI LdrLoadDllStub(const wchar_t* fileName, uint32_t* flags, UNICODE_
 	std::transform(moduleNameStr.begin(), moduleNameStr.end(), moduleNameStr.begin(), ::tolower);
 
 	if (moduleNameStr.find(L"fraps64.dll") != std::string::npos || moduleNameStr.find(L"avghooka.dll") != std::string::npos ||
-		// certain versions of RTSS crash d3d9.dll by badly patching Win10 RS2 hotpatch stubs
-		moduleNameStr.find(L"rtsshooks64.dll") != std::string::npos ||
 		// apparently crashes NUI
 		moduleNameStr.find(L"bdcam64.dll") != std::string::npos ||
 		// lots of crashes occur in the DiscordApp overlay
@@ -163,8 +316,14 @@ NTSTATUS NTAPI LdrLoadDllStub(const wchar_t* fileName, uint32_t* flags, UNICODE_
 		moduleNameStr.find(L"PrxerDrv.dll") != std::string::npos ||
 		// Ad Muncher, causes LoopbackTcpServer to crash
 		moduleNameStr.find(L"am64-34121.dll") != std::string::npos ||
+#if !defined(IS_RDR3)
 		// VulkanRT loader, we don't use Vulkan, CEF does (to 'collect info'), and this crashes a lot of Vulkan drivers
-		moduleNameStr.find(L"vulkan-1.dll") != std::string::npos
+		moduleNameStr.find(L"vulkan-1.dll") != std::string::npos ||
+#else
+		// VulkanRT loader, we don't use Vulkan, CEF does (to 'collect info'), and this crashes a lot of Vulkan drivers
+		(moduleNameStr.find(L"vulkan-1.dll") != std::string::npos && getenv("CitizenFX_ToolMode")) ||
+#endif
+		false
 	)
 	{
 		return 0xC0000135;
@@ -401,12 +560,98 @@ static HRESULT WINAPI QueryDListForApplication1Stub(BOOL* pDefaultToDiscrete, HA
 
 static FARPROC(WINAPI* g_origGetProcAddress)(HMODULE hModule, LPCSTR procName, void* caller);
 
+NTSTATUS NTAPI NtCloseHook(IN HANDLE Handle);
+NTSTATUS NtQueryInformationProcessHook(IN HANDLE ProcessHandle, IN PROCESSINFOCLASS ProcessInformationClass, OUT PVOID ProcessInformation, IN ULONG ProcessInformationLength, OUT PULONG ReturnLength OPTIONAL);
+
+extern "C" NTSTATUS NTAPI NtQueryVirtualMemory(
+	HANDLE                   ProcessHandle,
+	PVOID                    BaseAddress,
+	INT MemoryInformationClass,
+	PVOID                    MemoryInformation,
+	SIZE_T                   MemoryInformationLength,
+	PSIZE_T                  ReturnLength
+);
+
+NTSTATUS NtQueryVirtualMemoryHook(
+	HANDLE                   ProcessHandle,
+	PVOID                    BaseAddress,
+	INT MemoryInformationClass,
+	PVOID                    MemoryInformation,
+	SIZE_T                   MemoryInformationLength,
+	PSIZE_T                  ReturnLength
+)
+{
+	return NtQueryVirtualMemory(ProcessHandle, BaseAddress, MemoryInformationClass, MemoryInformation, MemoryInformationLength, ReturnLength);
+}
+
+#include <Hooking.h>
+
 FARPROC WINAPI GetProcAddressStub(HMODULE hModule, LPCSTR lpProcName, void* caller)
 {
 	static const DWORD bigOne = 1;
+	static auto ntdllRef = GetModuleHandleW(L"ntdll.dll");
 
 	if (!IS_INTRESOURCE(lpProcName))
 	{
+		if (true)
+		{
+			if (hModule == ntdllRef && _stricmp(lpProcName, "NtQueryInformationProcess") == 0)
+			{
+				char* ntdll = (char*)ntdllRef;
+				auto ntdllImage = (PIMAGE_DOS_HEADER)ntdll;
+				auto ntdllPE = (PIMAGE_NT_HEADERS)(ntdll + ntdllImage->e_lfanew);
+
+				auto lol = ntdll + ntdllPE->OptionalHeader.BaseOfCode + ntdllPE->OptionalHeader.SizeOfCode - 0x40;
+
+				static std::once_flag lold;
+
+				std::call_once(lold, [lol]
+				{
+					DWORD oldProtect;
+					VirtualProtect(lol, 48, PAGE_EXECUTE_READWRITE, &oldProtect);
+
+					static struct : jitasm::Frontend
+					{
+						uintptr_t f;
+
+						void InternalMain() override
+						{
+							mov(rax, qword_ptr[rsp + 0x28]);
+							sub(rsp, 0x38);
+							mov(qword_ptr[rsp + 0x20], rax);
+							mov(rax, f);
+							call(rax);
+							add(rsp, 0x38);
+							ret();
+						}
+					} g;
+
+					g.f = (uint64_t)NtQueryInformationProcessHook;
+
+					auto c = g.GetCode();
+					memcpy(lol, c, g.GetCodeSize());
+
+					VirtualProtect(lol, 48, PAGE_EXECUTE_READ, &oldProtect);
+				});
+
+				return (FARPROC)lol;
+
+				//return (FARPROC)NtQueryInformationProcessHook;
+				//return (FARPROC)NtQueryInformationProcess;
+			}
+
+			if (hModule == ntdllRef && _stricmp(lpProcName, "NtQueryVirtualMemory") == 0)
+			{
+				return (FARPROC)NtQueryVirtualMemoryHook;
+				//return (FARPROC)NtQueryInformationProcess;
+			}
+
+			if (hModule == ntdllRef && _stricmp(lpProcName, "NtClose") == 0)
+			{
+				//return (FARPROC)NtCloseHook;
+			}
+		}
+
 		if (_stricmp(lpProcName, "NvOptimusEnablement") == 0 || _stricmp(lpProcName, "AmdPowerXpressRequestHighPerformance") == 0)
 		{
 			return (FARPROC)&bigOne;
@@ -538,6 +783,8 @@ extern "C" DLL_EXPORT void CoreSetMappingFunction(MappingFunctionType function)
 	g_mappingFunction = function;
 	g_tlsHandle = TlsAlloc();
 
+	LSP_InitializeHooks();
+
 	MH_CreateHookApi(L"ntdll.dll", "NtCreateFile", NtCreateFileStub, (void**)&g_origNtCreateFile);
 	MH_CreateHookApi(L"ntdll.dll", "NtOpenFile", NtOpenFileStub, (void**)&g_origNtOpenFile);
 	MH_CreateHookApi(L"ntdll.dll", "NtDeleteFile", NtDeleteFileStub, (void**)&g_origNtDeleteFile);
@@ -545,15 +792,12 @@ extern "C" DLL_EXPORT void CoreSetMappingFunction(MappingFunctionType function)
 	MH_CreateHookApi(L"ntdll.dll", "LdrLoadDll", LdrLoadDllStub, (void**)&g_origLoadDll);
 	MH_CreateHookApi(L"ntdll.dll", "LdrGetProcedureAddress", LdrGetProcedureAddressStub, (void**)&g_origGetProcedureAddress);
 	MH_CreateHookApi(L"kernelbase.dll", "RegOpenKeyExW", RegOpenKeyExWStub, (void**)&g_origRegOpenKeyExW);
+	MH_CreateHookApi(L"kernelbase.dll", "GetFileAttributesExW", GetFileAttributesExWStub, (void**)&g_origGetFileAttributesExW);
 	MH_CreateHookApi(L"kernelbase.dll", "GetProcAddressForCaller", GetProcAddressStub, (void**)&g_origGetProcAddress);
 	MH_EnableHook(MH_ALL_HOOKS);
 
 	static auto _LdrRegisterDllNotification = (decltype(&LdrRegisterDllNotification))GetProcAddress(GetModuleHandle(L"ntdll.dll"), "LdrRegisterDllNotification");
 	_LdrRegisterDllNotification(0, LdrDllNotification, nullptr, &g_lastDllNotif);
-
-    LSP_InitializeHooks();
-
-	trace("Initialized system mapping!\n");
 }
 
 #include <Hooking.Patterns.h>

@@ -39,9 +39,22 @@
 #include <pplawait.h>
 #include <experimental/resumable>
 
+static bool IsBlockedResource(const std::string& resourceName, std::string* why)
+{
+	if (resourceName == "xrp" || resourceName == "xrp_skin" || resourceName == "xrp_identity" || resourceName == "xrp_respawn")
+	{
+		*why = "'xrp' has been implicated in selling paid access to core functionality outside of the Commerce system, violating the no-profit-from-UGC rule imposed by the CitizenFX Collective. Because of this, any associated resources are blocked.";
+		return true;
+	}
+
+	return false;
+}
+
 static NetAddress g_netAddress;
 
 static std::set<std::string> g_resourceStartRequestSet;
+
+using ResultTuple = std::tuple<tl::expected<fwRefContainer<fx::Resource>, fx::ResourceManagerError>, std::string>;
 
 static std::string CrackResourceName(const std::string& uri)
 {
@@ -59,7 +72,10 @@ static std::string CrackResourceName(const std::string& uri)
 	return "MISSING";
 }
 
-static pplx::task<std::vector<std::tuple<fwRefContainer<fx::Resource>, std::string>>> DownloadResources(std::vector<std::string> requiredResources, NetLibrary* netLibrary)
+static std::mutex progressMutex;
+static std::optional<std::tuple<std::string, int, int>> nextProgress;
+
+static pplx::task<std::vector<ResultTuple>> DownloadResources(std::vector<std::string> requiredResources, NetLibrary* netLibrary)
 {
 	struct ProgressData
 	{
@@ -69,7 +85,7 @@ static pplx::task<std::vector<std::tuple<fwRefContainer<fx::Resource>, std::stri
 
 	fx::ResourceManager* manager = Instance<fx::ResourceManager>::Get();
 
-	std::vector<std::tuple<fwRefContainer<fx::Resource>, std::string>> list;
+	std::vector<ResultTuple> list;
 
 	auto progressCounter = std::make_shared<ProgressData>();
 	progressCounter->current = 0;
@@ -88,16 +104,12 @@ static pplx::task<std::vector<std::tuple<fwRefContainer<fx::Resource>, std::stri
 			}
 		}
 
-		static uint64_t lastDownloadTime = GetTickCount64();
-
 		auto throttledConnectionProgress = [netLibrary](const std::string& string, int count, int total)
 		{
-			if ((GetTickCount64() - lastDownloadTime) > 500)
-			{
-				netLibrary->OnConnectionProgress(string, count, total);
-
-				lastDownloadTime = GetTickCount64();
-			}
+			std::lock_guard<std::mutex> _(progressMutex);
+			nextProgress = { string,
+				count,
+				total };
 		};
 
 		auto mounterRef = manager->GetMounterForUri(resourceUri);
@@ -107,7 +119,7 @@ static pplx::task<std::vector<std::tuple<fwRefContainer<fx::Resource>, std::stri
 				downloadCurrent / 1024.0f / 1024.0f, downloadTotal / 1024.0f / 1024.0f), progressCounter->current, progressCounter->total);
 		});
 
-		auto resource = co_await manager->AddResource(resourceUri);
+		auto resource = co_await manager->AddResourceWithError(resourceUri);
 
 		// report progress
 		int currentCount = progressCounter->current.fetch_add(1) + 1;
@@ -117,7 +129,7 @@ static pplx::task<std::vector<std::tuple<fwRefContainer<fx::Resource>, std::stri
 		list.emplace_back(resource, resourceName);
 	}
 
-	return list;
+	co_return list;
 }
 
 static NetLibrary* g_netLibrary;
@@ -209,7 +221,12 @@ static InitFunction initFunction([] ()
 			std::string addressAddress = address.GetAddress();
 			uint32_t addressPort = address.GetPort();
 
-			httpClient->DoPostRequest(fmt::sprintf("%sclient", netLibrary->GetCurrentServerUrl()), httpClient->BuildPostString(postMap), options, [=] (bool result, const char* data, size_t size)
+			auto curServerUrl = fmt::sprintf("https://%s/", netLibrary->GetCurrentPeer().ToString()); 
+
+			// #TODO: remove this once server version with `18d5259f60dd203b5705130491ddda4e95665171` becomes mandatory
+			auto curServerUrlNonTls = fmt::sprintf("http://%s/", netLibrary->GetCurrentPeer().ToString()); 
+
+			httpClient->DoPostRequest(fmt::sprintf("%sclient", curServerUrlNonTls), httpClient->BuildPostString(postMap), options, [=](bool result, const char* data, size_t size)
 			{
 				// keep a reference to the HTTP client
 				auto httpClientRef = httpClient;
@@ -218,37 +235,10 @@ static InitFunction initFunction([] ()
 				// handle failure
 				if (!result)
 				{
-					GlobalError("Obtaining configuration from server (%s) failed.", addressClone.GetAddress().c_str());
+					GlobalError("Obtaining configuration from server failed. Error state: %s", std::string{ data, size });
 
 					return;
 				}
-
-				std::string respData(data, size);
-
-				httpClient->DoGetRequest(fmt::sprintf("https://runtime.fivem.net/config_upload/enable?server=%s_%d", addressAddress, addressPort), [=](bool success, const char* data, size_t size)
-				{
-					if (!success)
-					{
-						return;
-					}
-
-					if (data[0] != 'y')
-					{
-						return;
-					}
-
-					httpClient->DoPostRequest(fmt::sprintf("https://runtime.fivem.net/config_upload/upload?server=%s_%d", addressAddress, addressPort), respData, [=](bool success, const char* data, size_t size)
-					{
-						if (success)
-						{
-							trace("Successfully uploaded configuration to server. Thanks for helping!\n");
-						}
-						else
-						{
-							trace("Failed to upload configuration to server. This is not a problem.\n%s", std::string(data, size));
-						}
-					});
-				});
 
 				// 'get' the server host
 				std::string serverHost = addressClone.GetAddress() + va(":%d", addressClone.GetPort());
@@ -261,6 +251,20 @@ static InitFunction initFunction([] ()
 				{
 					auto err = node.GetParseError();
 					GlobalError("parse error %d", err);
+
+					return;
+				}
+
+				if (!node.IsObject())
+				{
+					GlobalError("Obtaining configuration from server failed. JSON data was not an object.");
+
+					return;
+				}
+
+				if (node.HasMember("error") && node["error"].IsString())
+				{
+					GlobalError("Obtaining configuration from server failed. Error text: %s", node["error"].GetString());
 
 					return;
 				}
@@ -292,6 +296,8 @@ static InitFunction initFunction([] ()
 					auto& resources = node["resources"];
 
 					std::string origBaseUrl = node["fileServer"].GetString();
+					std::stringstream formattedResources;
+					size_t formatCount = 0;
 
 					for (auto it = resources.Begin(); it != resources.End(); it++)
 					{
@@ -304,11 +310,20 @@ static InitFunction initFunction([] ()
 							baseUrl = (*it)["fileServer"].GetString();
 						}
 
-						boost::algorithm::replace_all(baseUrl, "http://%s/", netLibrary->GetCurrentServerUrl());
-						boost::algorithm::replace_all(baseUrl, "https://%s/", netLibrary->GetCurrentServerUrl());
+						boost::algorithm::replace_all(baseUrl, "http://%s/", curServerUrl);
+						boost::algorithm::replace_all(baseUrl, "https://%s/", curServerUrl);
 
 						// define the resource in the mounter
 						std::string resourceName = resource["name"].GetString();
+
+						// block hardcoded block-resources
+						std::string reasoning;
+
+						if (IsBlockedResource(resourceName, &reasoning))
+						{
+							GlobalError("Resource with name %s is blocked by global policy. %s", resourceName, reasoning);
+							break;
+						}
 
 						// get the mounter, first
 						auto uri = "global://" + resourceName;
@@ -398,10 +413,18 @@ static InitFunction initFunction([] ()
 							}
 						}
 
-						trace("[%s]\n", resourceName.c_str());
+						formattedResources << resourceName << " ";
+
+						if (formatCount >= 10)
+						{
+							formattedResources << "\n";
+							formatCount = 0;
+						}
 
 						requiredResources.push_back(uri);
 					}
+
+					trace("Required resources: %s\n", formattedResources.str());
 				}
 
 				// failure should reset the requested resource, instead
@@ -410,20 +433,15 @@ static InitFunction initFunction([] ()
 					g_resourceStartRequestSet.erase(updateList);
 				}
 
-				using ResultTuple = std::tuple<fwRefContainer<fx::Resource>, std::string>;
-
 				DownloadResources(requiredResources, netLibrary).then([=] (std::vector<ResultTuple> resources)
 				{
 					for (auto& resourceData : resources)
 					{
-						auto resource = std::get<fwRefContainer<fx::Resource>>(resourceData);
+						auto resource = std::get<0>(resourceData);
 
-						if (!resource.GetRef())
+						if (!resource)
 						{
-							if (updateList.empty())
-							{
-								GlobalError("Couldn't load resource %s. :(", std::get<std::string>(resourceData));
-							}
+							GlobalError("Couldn't load resource %s: %s", std::get<std::string>(resourceData), resource.error().Get());
 
 							executeNextGameFrame.push([]
 							{
@@ -436,7 +454,7 @@ static InitFunction initFunction([] ()
 
 					for (auto& resourceData : resources)
 					{
-						auto resource = std::get<fwRefContainer<fx::Resource>>(resourceData);
+						auto resource = std::get<0>(resourceData).value_or(nullptr);
 
 						if (resource.GetRef())
 						{
@@ -446,7 +464,7 @@ static InitFunction initFunction([] ()
 							{
 								if (!resource->Start())
 								{
-									GlobalError("Couldn't start resource %s. :(", resourceName.c_str());
+									GlobalError("Couldn't start resource %s.", resourceName.c_str());
 								}
 							});
 						}
@@ -512,12 +530,17 @@ static InitFunction initFunction([] ()
 
 		netLibrary->OnConnectionError.Connect([](const char* error)
 		{
+			{
+				std::lock_guard<std::mutex> _(progressMutex);
+				nextProgress = {};
+			}
+
 			executeNextGameFrame.push([]()
 			{
 				fx::ResourceManager* resourceManager = Instance<fx::ResourceManager>::Get();
 				resourceManager->ResetResources();
 			});
-		});
+		}, -500);
 
 		OnGameFrame.Connect([] ()
 		{
@@ -529,6 +552,23 @@ static InitFunction initFunction([] ()
 				{
 					func();
 				}
+			}
+
+			static uint64_t lastDownloadTime;
+
+			if ((GetTickCount64() - lastDownloadTime) > 200)
+			{
+				std::lock_guard<std::mutex> _(progressMutex);
+
+				if (nextProgress)
+				{
+					auto [string, count, total] = *nextProgress;
+					g_netLibrary->OnConnectionProgress(string, count, total);
+
+					nextProgress = {};
+				}
+
+				lastDownloadTime = GetTickCount64();
 			}
 
 			auto reassembler = Instance<fx::ResourceManager>::Get()->GetComponent<fx::EventReassemblyComponent>();
@@ -543,7 +583,7 @@ static InitFunction initFunction([] ()
 
 		netLibrary->AddReliableHandler("msgNetEvent", [] (const char* buf, size_t len)
 		{
-			NetBuffer buffer(buf, len);
+			net::Buffer buffer(reinterpret_cast<const uint8_t*>(buf), len);
 
 			// get the source net ID
 			uint16_t sourceNetID = buffer.Read<uint16_t>();
@@ -637,13 +677,13 @@ static InitFunction initFunction([] ()
 
 			netLibrary->OnTriggerServerEvent(eventName, eventPayload);
 
-			NetBuffer buffer(131072);
+			net::Buffer buffer;
 			buffer.Write<uint16_t>(eventName.size() + 1);
 			buffer.Write(eventName.c_str(), eventName.size() + 1);
 
 			buffer.Write(eventPayload.c_str(), eventPayload.size());
 
-			netLibrary->SendReliableCommand("msgServerEvent", buffer.GetBuffer(), buffer.GetCurLength());
+			netLibrary->SendReliableCommand("msgServerEvent", reinterpret_cast<const char*>(buffer.GetBuffer()), buffer.GetCurOffset());
 		});
 
 		fx::ScriptEngine::RegisterNativeHandler("TRIGGER_LATENT_SERVER_EVENT_INTERNAL", [=](fx::ScriptContext& context)
@@ -656,7 +696,7 @@ static InitFunction initFunction([] ()
 			int bps = context.GetArgument<int>(3);
 
 			auto reassembler = Instance<fx::ResourceManager>::Get()->GetComponent<fx::EventReassemblyComponent>();
-			reassembler->TriggerEvent(0, eventName, eventPayload, bps);
+			reassembler->TriggerEvent(0, std::string_view{ eventName.c_str(), eventName.size() + 1 }, eventPayload, bps);
 		});
 
 		netLibrary->OnFinalizeDisconnect.Connect([=](NetAddress)
@@ -686,11 +726,11 @@ static InitFunction initFunction([] ()
 
 			std::string s = console::GetDefaultContext()->GetCommandManager()->GetRawCommand();
 
-			NetBuffer buffer(131072);
+			net::Buffer buffer;
 			buffer.Write<uint16_t>(s.size());
 			buffer.Write(s.c_str(), std::min(s.size(), static_cast<size_t>(INT16_MAX)));
 
-			netLibrary->SendReliableCommand("msgServerCommand", buffer.GetBuffer(), buffer.GetCurLength());
+			netLibrary->SendReliableCommand("msgServerCommand", reinterpret_cast<const char*>(buffer.GetBuffer()), buffer.GetCurOffset());
 
 			return false;
 		}, 99999);

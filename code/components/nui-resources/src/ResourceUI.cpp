@@ -14,6 +14,8 @@
 #include <ResourceMetaDataComponent.h>
 #include <ResourceGameLifetimeEvents.h>
 
+#include <ResourceManager.h>
+
 #include <mutex>
 
 ResourceUI::ResourceUI(Resource* resource)
@@ -60,14 +62,32 @@ bool ResourceUI::Create()
 	std::transform(resourceName.begin(), resourceName.end(), resourceName.begin(), ::ToLower);
 	CefRegisterSchemeHandlerFactory("http", resourceName, Instance<NUISchemeHandlerFactory>::Get());
 	CefRegisterSchemeHandlerFactory("https", resourceName, Instance<NUISchemeHandlerFactory>::Get());
+	CefRegisterSchemeHandlerFactory("https", "cfx-nui-" + resourceName, Instance<NUISchemeHandlerFactory>::Get());
 
 	// create the NUI frame
-	std::string path = "nui://" + m_resource->GetName() + "/" + pageName;
-	nui::CreateFrame(m_resource->GetName(), path);
+	auto rmvRes = metaData->IsManifestVersionBetween("cerulean", "");
+	auto uiPrefix = (!rmvRes || !*rmvRes) ? "nui://" : "https://cfx-nui-";
+
+	std::string path = uiPrefix + m_resource->GetName() + "/" + pageName;
+
+	auto uiPagePreloadData = metaData->GetEntries("ui_page_preload");
+	bool uiPagePreload = std::distance(uiPagePreloadData.begin(), uiPagePreloadData.end()) > 0;
+
+	if (uiPagePreload)
+	{
+		nui::CreateFrame(m_resource->GetName(), path);
+	}
+	else
+	{
+		nui::PrepareFrame(m_resource->GetName(), path);
+	}
 
 	// add a cross-origin entry to allow fetching the callback handler
 	CefAddCrossOriginWhitelistEntry(va("nui://%s", m_resource->GetName().c_str()), "http", m_resource->GetName(), true);
 	CefAddCrossOriginWhitelistEntry(va("nui://%s", m_resource->GetName().c_str()), "https", m_resource->GetName(), true);
+	
+	CefAddCrossOriginWhitelistEntry(va("https://cfx-nui-%s", m_resource->GetName().c_str()), "https", m_resource->GetName(), true);
+	CefAddCrossOriginWhitelistEntry(va("https://cfx-nui-%s", m_resource->GetName().c_str()), "nui", m_resource->GetName(), true);
 
 	return true;
 }
@@ -108,8 +128,32 @@ void ResourceUI::SignalPoll()
 static std::map<std::string, fwRefContainer<ResourceUI>> g_resourceUIs;
 static std::mutex g_resourceUIMutex;
 
+#include <boost/algorithm/string.hpp>
+
 static InitFunction initFunction([] ()
 {
+	fx::ResourceManager::OnInitializeInstance.Connect([](fx::ResourceManager* manager)
+	{
+		nui::SetResourceLookupFunction([manager](const std::string& resourceName)
+		{
+			auto resource = manager->GetResource(resourceName);
+
+			if (resource.GetRef())
+			{
+				auto path = resource->GetPath();
+
+				if (!boost::algorithm::ends_with(path, "/"))
+				{
+					path += "/";
+				}
+
+				return path;
+			}
+
+			return fmt::sprintf("resources:/%s/", resourceName);
+		});
+	});
+
 	Resource::OnInitializeInstance.Connect([] (Resource* resource)
 	{
 		// create the UI instance
@@ -136,6 +180,7 @@ static InitFunction initFunction([] ()
 			}
 		});
 
+#ifdef GTA_FIVE
 		// pre-disconnect handling
 		resource->GetComponent<fx::ResourceGameLifetimeEvents>()->OnBeforeGameShutdown.Connect([=]()
 		{
@@ -147,6 +192,7 @@ static InitFunction initFunction([] ()
 				g_resourceUIs.erase(resource->GetName());
 			}
 		});
+#endif
 
 		// add component
 		resource->SetComponent(resourceUI);

@@ -1,8 +1,6 @@
 stages:
   - build
   - deploy
-  - post
-  - linux
 
 .buildscript: &build_windows
   stage: build
@@ -23,6 +21,7 @@ build_client:
       - caches/caches.xml
       - caches/CitizenFX.exe.xz
       - caches/version.txt
+      - ext/native-doc-gen/natives_cfx.json
     expire_in: 1 month
   cache:
     key: client
@@ -33,10 +32,35 @@ build_client:
   except:
     - server-ci
     - tags
+
+build_client_rdr3:
+  <<: *build_windows
+  tags:
+    - vs2017
+    - client2
+  variables:
+    IS_FXSERVER: '0'
+    IS_LAUNCHER: '0'
+    IS_RDR3: '1'
+  artifacts:
+    paths:
+      - caches/diff/
+      - caches/caches.xml
+      - caches/CitizenFX.exe.xz
+      - caches/version.txt
+    expire_in: 1 month
+  cache:
+    key: rdr3
+    untracked: true
+    paths:
+      - code/shared/citversion.h
+      - code/build/
+  except:
+    - server-ci
+    - tags
     
 build_launcher:
   <<: *build_windows
-  stage: post
   tags:
     - vs2017
     - client
@@ -57,6 +81,7 @@ build_launcher:
       - code/shared/citversion.h
       - code/build/
   except:
+    - master
     - server-ci
     - tags
 
@@ -75,16 +100,17 @@ build_server_windows:
     - tags
     #- master
     - feature/update-to-1365
+    #- portability-rdr3
     #- feature/update-to-1493
   cache:
     key: server
     untracked: true
 
 build_proot_linux:
-  stage: linux
-  image: mcr.microsoft.com/dotnet/core/sdk:2.2-alpine3.9
+  stage: build
+  image: mcr.microsoft.com/dotnet/core/sdk:2.1-alpine3.11
   variables:
-    GIT_SUBMODULE_STRATEGY: recursive
+    GIT_SUBMODULE_STRATEGY: normal
     # workaround gitlab-ci-multi-runner#2148
     GIT_SSL_CAPATH: /etc/ssl/certs/
     DOCKER_TLS_CERTDIR: ""
@@ -100,13 +126,15 @@ build_proot_linux:
     - feature/update-to-1604
     - feature/cloning-stuff-releng
     - feature/cloning-plus
+    - portability-rdr3
   tags:
     - linux
 
 deploy_specific:
   stage: deploy
-  dependencies:
-    - build_client
+  needs:
+    - job: build_client
+      artifacts: true
   script:
     - ".\\code\\tools\\ci\\build.ps1 -DontBuild $true"
   environment:
@@ -120,11 +148,35 @@ deploy_specific:
     - master
     - server-ci
     - tags
+    
+deploy_rdr3_specific:
+  stage: deploy
+  needs:
+    - job: build_client_rdr3
+      artifacts: true
+  script:
+    - ".\\code\\tools\\ci\\build.ps1 -DontBuild $true"
+  environment:
+    name: specific/$CI_BUILD_REF_NAME
+  only:
+    - branches
+  tags:
+    - vs2017
+    - client2
+  variables:
+    IS_FXSERVER: '0'
+    IS_LAUNCHER: '0'
+    IS_RDR3: '1'
+  except:
+    - master
+    - server-ci
+    - tags
 
 deploy_canary:
   stage: deploy
-  dependencies:
-    - build_client
+  needs:
+    - job: build_client
+      artifacts: true
   script:
     - ".\\code\\tools\\ci\\build.ps1 -DontBuild $true"
   environment:
@@ -135,10 +187,30 @@ deploy_canary:
   only:
     - master
     
+deploy_canary_rdr3:
+  stage: deploy
+  needs:
+    - job: build_client_rdr3
+      artifacts: true
+  script:
+    - ".\\code\\tools\\ci\\build.ps1 -DontBuild $true"
+  environment:
+    name: canary
+  tags:
+    - vs2017
+    - client2
+  variables:
+    IS_FXSERVER: '0'
+    IS_LAUNCHER: '0'
+    IS_RDR3: '1'
+  only:
+    - master
+    
 deploy_launcher:
-  stage: linux
-  dependencies:
-    - build_launcher
+  stage: deploy
+  needs:
+    - job: build_launcher
+      artifacts: true
   variables:
     IS_LAUNCHER: '1'
   script:
@@ -149,12 +221,13 @@ deploy_launcher:
     - vs2017
     - client
   only:
-    - master
+    - nah
 
 deploy_prod:
   stage: deploy
-  dependencies:
-    - build_client
+  needs:
+    - job: build_client
+      artifacts: true
   script:
     - ".\\code\\tools\\ci\\build.ps1 -DontBuild $true"
   environment:
@@ -166,17 +239,38 @@ deploy_prod:
   only:
     - master
     
+deploy_prod_rdr3:
+  stage: deploy
+  needs:
+    - job: build_client_rdr3
+      artifacts: true
+  script:
+    - ".\\code\\tools\\ci\\build.ps1 -DontBuild $true"
+  environment:
+    name: production
+  when: manual
+  tags:
+    - vs2017
+    - client2
+  variables:
+    IS_FXSERVER: '0'
+    IS_LAUNCHER: '0'
+    IS_RDR3: '1'
+  only:
+    - master
+    
 typings_server:
   stage: deploy
-  dependencies:
-    - build_server_windows
+  needs:
+    - job: build_server_windows
+      artifacts: true
   image: node:alpine
   tags:
     - linux
   only:
     - master
   variables:
-    GIT_SUBMODULE_STRATEGY: recursive
+    GIT_SUBMODULE_STRATEGY: normal
     # workaround gitlab-ci-multi-runner#2148
     GIT_SSL_CAPATH: /etc/ssl/certs/
   script:
@@ -184,8 +278,9 @@ typings_server:
     
 typings_client:
   stage: deploy
-  dependencies:
-    - build_client
+  needs:
+    - job: build_client
+      artifacts: true
   tags:
     - vs2017
   only:
@@ -195,8 +290,9 @@ typings_client:
     
 nuget_client:
   stage: deploy
-  dependencies:
-    - build_client
+  needs:
+    - job: build_client
+      artifacts: true
   tags:
     - vs2017
   only:
@@ -206,8 +302,9 @@ nuget_client:
     
 nuget_server:
   stage: deploy
-  dependencies:
-    - build_server_windows
+  needs:
+    - job: build_server_windows
+      artifacts: true
   tags:
     - vs2017
   only:

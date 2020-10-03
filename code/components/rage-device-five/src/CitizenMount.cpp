@@ -16,6 +16,10 @@
 
 #include <VFSManager.h>
 #include <VFSRagePackfile7.h>
+#include <RelativeDevice.h>
+
+#include <CL2LaunchMode.h>
+#include <CrossBuildRuntime.h>
 
 #include <Error.h>
 
@@ -25,9 +29,6 @@ static int(__cdecl* origSetFunc)(void* extraContentMgr, void* a2, const char* de
 int someFunc(void* a1, void* a2, const char* a3)
 {
 	int someResult = origSetFunc(a1, a2, a3);
-
-	// add a fiDeviceRelative for a3 (f.i. dlc_dick:/, breakpoint to be sure) to wherever-the-fuck-you-want, removing the :/ at the end for the target path)
-	trace("somefunc found %s!\n", a3);
 	
 	std::string dlcName = std::string(a3);
 	dlcName = dlcName.substr(0, dlcName.find(":"));
@@ -49,8 +50,6 @@ int someFunc(void* a1, void* a2, const char* a3)
 
 		if (exists(name))
 		{
-			trace("dlc mounted: %s\n", name.c_str());
-
 			{
 				rage::fiDeviceRelative* dlc = new rage::fiDeviceRelative();
 				dlc->SetPath(name.c_str(), true);
@@ -70,8 +69,6 @@ int someFunc(void* a1, void* a2, const char* a3)
 
 		if (exists(name))
 		{
-			trace("dlc mounted: %s\n", name.c_str());
-
 			rage::fiDeviceRelative* dlc = new rage::fiDeviceRelative();
 			dlc->SetPath(name.c_str(), true);
 			dlc->Mount((dlcName + "CRC:/").c_str());
@@ -80,6 +77,7 @@ int someFunc(void* a1, void* a2, const char* a3)
 
 	return someResult;
 }
+
 static HookFunction hookFunction([]()
 {
 	hook::set_call(&origSetFunc, hook::pattern("66 39 79 38 74 06 4C 8B  41 30 EB 07 4C 8D").count(1).get(0).get<void>(19));
@@ -87,6 +85,37 @@ static HookFunction hookFunction([]()
 });
 
 #include <ShlObj.h>
+#include <boost/algorithm/string.hpp>
+
+class PathFilteringDevice : public vfs::RelativeDevice
+{
+public:
+	PathFilteringDevice(const std::string& path)
+		: vfs::RelativeDevice(path)
+	{
+
+	}
+
+	virtual THandle Open(const std::string& fileName, bool readOnly) override
+	{
+		std::string relPath = fileName.substr(strlen("commonFilter:/"));
+
+		boost::algorithm::replace_all(relPath, "\\", "/");
+		boost::algorithm::to_lower(relPath);
+
+		if (relPath == "data/levels/gta5/trains.xml" ||
+			relPath == "data/materials/materials.dat" ||
+			relPath == "data/relationships.dat" ||
+			relPath == "data/dlclist.xml" ||
+			relPath == "data/ai/scenarios.meta" ||
+			relPath == "data/ai/conditionalanims.meta")
+		{
+			return InvalidHandle;
+		}
+
+		return RelativeDevice::Open(fileName, readOnly);
+	}
+};
 
 static InitFunction initFunction([] ()
 {
@@ -108,7 +137,7 @@ static InitFunction initFunction([] ()
 		cfxDevice->SetPath(fxRoot.c_str(), true);
 		cfxDevice->Mount("cfx:/");
 
-		std::wstring cachePath = MakeRelativeCitPath(L"cache");
+		std::wstring cachePath = MakeRelativeCitPath(fmt::sprintf(L"cache%s", ToWide(launch::GetPrefixedLaunchModeKey("\\"))));
 
 		if (GetFileAttributes(cachePath.c_str()) == INVALID_FILE_ATTRIBUTES)
 		{
@@ -121,14 +150,26 @@ static InitFunction initFunction([] ()
 		cacheDevice->SetPath(cacheRoot.c_str(), true);
 		cacheDevice->Mount("rescache:/");
 
+		if (!Is372())
 		{
 			std::string narrowPath;
 
-			if (CfxIsSinglePlayer() || true)
+			if (!CfxIsSinglePlayer())
+			{
+				std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>, wchar_t> converter;
+				narrowPath = converter.to_bytes(MakeRelativeCitPath(L"citizen\\common\\"s));
+
+				fwRefContainer<PathFilteringDevice> filterDevice = new PathFilteringDevice(narrowPath);
+				vfs::Mount(filterDevice, "commonFilter:/");
+
+				narrowPath = "commonFilter:/";
+			}
+			else if (CfxIsSinglePlayer())
 			{
 				std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>, wchar_t> converter;
 				narrowPath = converter.to_bytes(MakeRelativeCitPath(L"citizen\\common"s + (CfxIsSinglePlayer() ? L"-sp" : L"")));
 			}
+#if 0
 			else
 			{
 				static fwRefContainer<vfs::RagePackfile7> citizenCommon = new vfs::RagePackfile7();
@@ -140,6 +181,7 @@ static InitFunction initFunction([] ()
 				vfs::Mount(citizenCommon, "citizen_common:/");
 				narrowPath = "citizen_common:/";
 			}
+#endif
 
 			rage::fiDeviceRelative* relativeDevice = new rage::fiDeviceRelative();
 			relativeDevice->SetPath(narrowPath.c_str(), nullptr, true);
@@ -244,7 +286,7 @@ static InitFunction initFunction([] ()
 				std::wstring profilePath = cfxPath + L"\\";
 
 				rage::fiDeviceRelative* fxUserDevice = new rage::fiDeviceRelative();
-				fxUserDevice->SetPath(converter.to_bytes(profilePath).c_str(), true);
+				fxUserDevice->SetPath(converter.to_bytes(profilePath).c_str(), false);
 				fxUserDevice->Mount("fxd:/");
 
 				CoTaskMemFree(appDataPath);

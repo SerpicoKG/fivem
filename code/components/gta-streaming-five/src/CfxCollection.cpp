@@ -319,8 +319,6 @@ public:
 
 	~CfxCollection()
 	{
-		trace("del cfxcollection %p\n", (void*)this);
-
 		g_cfxCollections.erase(this);
 
 		PseudoCallContext(this)->~fiCollection();
@@ -330,11 +328,6 @@ public:
 
 	void CleanCloseCollection()
 	{
-		if (m_isPseudoPack)
-		{
-			trace("close packfile %s\n", GetName());
-		}
-
 		std::unique_lock<std::recursive_mutex> lock(m_mutex);
 
 		m_entries.clear();
@@ -1306,7 +1299,7 @@ static void PtrError()
 {
 	if (CoreIsDebuggerPresent())
 	{
-		__debugbreak();
+ 		__debugbreak();
 	}
 
 	FatalError("Invalid fixup, address is neither virtual nor physical (in %s)", GetCurrentStreamingName());
@@ -2065,6 +2058,14 @@ extern fwEvent<> OnReloadMapStore;
 
 static const char* RegisterStreamingFileStrchrWrap(const char* str, const int ch)
 {
+	// do this here, as it's early
+	static bool inited = ([]()
+	{
+		g_streamingPackfiles->Get(0).isHdd = false;
+
+		return true;
+	})();
+
 	// set the name for the later hook to use
 	g_lastStreamingName = str;
 
@@ -2214,6 +2215,11 @@ namespace streaming
 
 		return nullptr;
 	}
+}
+
+static int ReturnTrue()
+{
+	return true;
 }
 
 #include <ICoreGameInit.h>
@@ -2430,6 +2436,9 @@ static HookFunction hookFunction([] ()
 		hook::call(loc, RemoveStreamingPackfileWrap);
 	}
 #endif
+
+	// 'should packfile meta cache (pfm.dat) be used'
+	//hook::call(hook::get_pattern("E8 ? ? ? ? E8 ? ? ? ? 84 C0 0F 84 ? ? 00 00 44 39 35", 5), ReturnTrue);
 
 	// make the pfm.dat read-only
 	{

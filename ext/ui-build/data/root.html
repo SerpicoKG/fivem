@@ -1,6 +1,7 @@
 <html>
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=0">
 <title>CitizenFX root UI</title>
 <style type="text/css">
 body
@@ -27,6 +28,10 @@ iframe
 window.citFrames = {};
 window.focusStack = [];
 
+let handoverBlob = {};
+let serverAddress = '';
+let frameEscapeFunctions = {};
+
 registerPushFunction(function(type, ...args) {
 	switch (type) {
 		case 'rootCall': {
@@ -37,6 +42,10 @@ registerPushFunction(function(type, ...args) {
 				focusFrame(data.frameName);
 			} else if (data.type == 'blurFrame') {
 				blurFrame(data.frameName);
+			} else if (data.type == 'setHandover') {
+				handoverBlob = data.data;
+			} else if (data.type == 'setServerAddress') {
+				serverAddress = data.data;
 			}
 			break;
 		}
@@ -65,6 +74,7 @@ registerFrameFunction(function(msg, frameName, frameUrl)
 		frame.style.visibility = 'hidden';
 		frame.allow = 'microphone *;';
 		frame.src = frameUrl;
+		frame.tabIndex = -1;
 
 		citFrames[frameName] = frame;
 		focusStack.push(frameName);
@@ -75,10 +85,24 @@ registerFrameFunction(function(msg, frameName, frameUrl)
 		{
 			frame.style.visibility = 'visible';
 		}, true);
+		
+		frameEscapeFunctions[frameName] = () => {
+			setTimeout(() => {
+				if (document.activeElement == document.body) {
+					frame.contentWindow.focus();
+				}
+			}, 32);
+		}
 
 		frame.contentWindow.GetParentResourceName = function()
 		{
 			return frameName;
+		}
+		
+		if (frameName === 'loadingScreen')
+		{
+			frame.contentWindow.nuiHandoverData = handoverBlob || {};
+			frame.contentWindow.nuiHandoverData.serverAddress = serverAddress;
 		}
 	}
 	else if (msg == "destroyFrame")
@@ -119,12 +143,16 @@ focusFrame = function(frameName)
 		thisFrame.style.zIndex = i.toString();
 	}
 
+	// register blur event for unintentional tab escapes
+	citFrames[frameName].contentWindow.addEventListener("blur", frameEscapeFunctions[frameName]);
 	// and focus the frame itself
 	citFrames[frameName].contentWindow.focus();
 };
 
 blurFrame = function(frameName)
 {
+	// intentional blur, remove blur listener
+	citFrames[frameName].contentWindow.removeEventListener("blur", frameEscapeFunctions[frameName]);
 	// remove focus
 	citFrames[frameName].contentWindow.blur();
 };

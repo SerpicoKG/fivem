@@ -55,11 +55,15 @@ struct HttpRequestOptions
 	std::function<bool(const std::string&)> streamingCallback;
 	std::chrono::milliseconds timeoutNoResponse;
 	int weight;
+	bool ipv4;
+	bool addErrorBody;
 
 	inline HttpRequestOptions()
 	{
 		timeoutNoResponse = std::chrono::milliseconds(0);
 		weight = 16;
+		ipv4 = false;
+		addErrorBody = false;
 	}
 };
 

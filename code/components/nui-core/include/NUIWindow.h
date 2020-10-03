@@ -8,9 +8,12 @@
 #pragma once
 
 #include <queue>
+#include <shared_mutex>
 
 #include <include/cef_client.h>
 #include <include/cef_v8.h>
+
+#include <concurrent_queue.h>
 
 enum NUIPaintType
 {
@@ -33,16 +36,21 @@ private:
 
 	void Initialize(CefString url);
 
+	concurrency::concurrent_queue<std::function<void()>> m_onLoadQueue;
+
 public:
 	NUIWindow(bool primary, int width, int height);
 
 private:
-	bool m_primary;
+	bool m_rawBlit;
 	int m_width;
 	int m_height;
 
 	int m_roundedWidth;
 	int m_roundedHeight;
+
+	uint32_t m_lastFrameTime;
+	uint32_t m_lastMessageTime;
 
 	unsigned long m_dirtyFlag;
 	RECT m_lastDirtyRect;
@@ -53,15 +61,15 @@ private:
 
 	std::set<std::string> m_pollQueue;
 
-	nui::GITexture* m_nuiTexture;
+	fwRefContainer<nui::GITexture> m_nuiTexture;
 
-	nui::GITexture* m_popupTexture;
+	fwRefContainer<nui::GITexture> m_popupTexture;
 
 	NUIPaintType m_paintType;
 
 	uint64_t m_syncKey;
 
-	std::map<CefRenderHandler::PaintElementType, nui::GITexture*> m_parentTextures;
+	std::map<CefRenderHandler::PaintElementType, fwRefContainer<nui::GITexture>> m_parentTextures;
 
 	ID3D11Texture2D* m_swapTexture;
 
@@ -75,6 +83,8 @@ private:
 
 	CefRect m_popupRect;
 
+	std::shared_mutex m_textureMutex;
+
 public:
 	inline int		GetWidth() { return m_width; }
 	inline int		GetHeight() { return m_height; }
@@ -82,18 +92,60 @@ public:
 	inline void*	GetRenderBuffer() { return m_renderBuffer; }
 	inline int		GetRoundedWidth() { return m_roundedWidth; }
 
+	void TouchMessage();
+
+	inline const std::string& GetName()
+	{
+		return m_name;
+	}
+
+	inline void SetName(const std::string& name)
+	{
+		m_name = name;
+	}
+
+	inline bool IsPrimary()
+	{
+		return m_rawBlit;
+	}
+
+	inline void ProcessLoadQueue()
+	{
+		std::function<void()> fn;
+
+		while (m_onLoadQueue.try_pop(fn))
+		{
+			fn();
+		}
+	}
+
+	inline void PushLoadQueue(std::function<void()>&& fn)
+	{
+		m_onLoadQueue.push(std::move(fn));
+	}
+
+private:
+	std::string m_name;
+
 public:
 	void			AddDirtyRect(const CefRect& rect);
 
 	inline void		MarkRenderBufferDirty() { InterlockedIncrement(&m_dirtyFlag); }
 
 public:
-	static fwRefContainer<NUIWindow> Create(bool primary, int width, int height, CefString url);
+	static fwRefContainer<NUIWindow> Create(bool primary, int width, int height, CefString url, bool instant);
+
+	void DeferredCreate();
+
+private:
+	CefString m_initUrl;
 
 public:
 	~NUIWindow();
 
 	void UpdateFrame();
+
+	void SendBeginFrame();
 
 	void Invalidate();
 
@@ -118,18 +170,26 @@ public:
 		}
 	}
 
-	inline nui::GITexture* GetTexture() { return m_nuiTexture; }
+	inline fwRefContainer<nui::GITexture> GetTexture() 
+	{
+		std::shared_lock<std::shared_mutex> _(m_textureMutex);
+		return m_nuiTexture;
+	}
 
-	inline nui::GITexture* GetPopupTexture() { return m_popupTexture; }
+	inline fwRefContainer<nui::GITexture> GetPopupTexture()
+	{
+		std::shared_lock<std::shared_mutex> _(m_textureMutex);
+		return m_popupTexture;
+	}
 
 	inline NUIPaintType GetPaintType() { return m_paintType; }
 
-	inline nui::GITexture* GetParentTexture(CefRenderHandler::PaintElementType type)
+	inline fwRefContainer<nui::GITexture> GetParentTexture(CefRenderHandler::PaintElementType type)
 	{
 		return m_parentTextures[type];
 	}
 
-	inline void SetParentTexture(CefRenderHandler::PaintElementType type, nui::GITexture* texture)
+	inline void SetParentTexture(CefRenderHandler::PaintElementType type, fwRefContainer<nui::GITexture> texture)
 	{
 		m_parentTextures[type] = texture;
 	}

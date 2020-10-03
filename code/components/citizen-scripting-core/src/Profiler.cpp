@@ -32,7 +32,8 @@ struct ProfilerRecording {
 	MSGPACK_DEFINE_MAP(ticks, events)
 };
 
-auto ConvertToStorage(const std::vector<fx::ProfilerEvent>& evs) -> ProfilerRecording
+template<typename TContainer>
+auto ConvertToStorage(const TContainer& evs) -> ProfilerRecording
 {
 	std::vector<uint64_t> ticks;
 	std::vector<ProfilerRecordingEvent> events;
@@ -40,7 +41,7 @@ auto ConvertToStorage(const std::vector<fx::ProfilerEvent>& evs) -> ProfilerReco
 	auto start_of_tick = true;
 	for (auto i = 0; i < evs.size(); i++)
 	{
-		const auto& ev = evs[i];
+		const fx::ProfilerEvent& ev = evs[i];
 		events.push_back({ (uint64_t)ev.when.count(), (int)ev.what, ev.where, ev.why });
 
 
@@ -218,20 +219,22 @@ auto ConvertToJSON(const ProfilerRecording& recording) -> json
 		case fx::ProfilerEventType::EXIT_RESOURCE:
 		case fx::ProfilerEventType::EXIT_SCOPE:
 		{
-			auto thisExit = eventStack.top();
-			eventStack.pop();
+			if (eventStack.size() != 0)
+			{
+				auto thisExit = eventStack.top();
+				eventStack.pop();
 
-			traceEvents.push_back(json::object({
-				{ "cat", "blink.user_timing" },
-				{ "name", (thisExit.what == (int)fx::ProfilerEventType::ENTER_RESOURCE)
-					? fmt::sprintf("%s (%s)", thisExit.why, thisExit.where)
-					: thisExit.where },
-				{ "ph", "E" },
-				{ "ts", event.when },
-				{ "pid", 1 },
-				{ "tid", 2 },
-				}));
-
+				traceEvents.push_back(json::object({
+					{ "cat", "blink.user_timing" },
+					{ "name", (thisExit.what == (int)fx::ProfilerEventType::ENTER_RESOURCE)
+						? fmt::sprintf("%s (%s)", thisExit.why, thisExit.where)
+						: thisExit.where },
+					{ "ph", "E" },
+					{ "ts", event.when },
+					{ "pid", 1 },
+					{ "tid", 2 },
+					}));
+			}
 			break;
 		}
 		}
@@ -263,12 +266,13 @@ std::string LookupName(fx::ProfilerEventType ty) {
 	}
 }
 
-void PrintEvents(const std::vector<fx::ProfilerEvent>& evs) {
+template<typename TContainer>
+void PrintEvents(const TContainer& evs) {
 	using EvType = fx::ProfilerEventType;
 
 	auto indent = 0;
 
-	for (const auto& ev : evs) {
+	for (const fx::ProfilerEvent& ev : evs) {
 		if (ev.what == EvType::EXIT_RESOURCE || ev.what == EvType::EXIT_SCOPE)
 		{
 			indent -= 2;
@@ -491,15 +495,8 @@ namespace profilerCommand {
 }
 
 namespace fx {
-	void ProfilerComponent::PushEvent(ProfilerEvent&& ev)
-	{
-		if (m_recording)
-		{
-			ev.when -= m_offset;
-			m_events.push_back(ev);
-		}
-	}
-	
+	DLL_EXPORT bool g_recordProfilerTime;
+
 	void ProfilerComponent::SubmitScreenshot(const void* imageRgb, size_t width, size_t height)
 	{
 		if (!IsRecording())
@@ -523,23 +520,23 @@ namespace fx {
 
 	void ProfilerComponent::EnterResource(const std::string& resource, const std::string& cause)
 	{
-		PushEvent({ ProfilerEventType::ENTER_RESOURCE, resource, cause });
+		PushEvent(ProfilerEventType::ENTER_RESOURCE, resource, cause);
 	}
 	void ProfilerComponent::ExitResource()
 	{
-		PushEvent({ ProfilerEventType::EXIT_RESOURCE });
+		PushEvent(ProfilerEventType::EXIT_RESOURCE);
 	}
 	void ProfilerComponent::EnterScope(const std::string& scope)
 	{
-		PushEvent({ ProfilerEventType::ENTER_SCOPE, scope, {} });
+		PushEvent(ProfilerEventType::ENTER_SCOPE, scope, std::string{});
 	}
 	void ProfilerComponent::ExitScope()
 	{
-		PushEvent({ ProfilerEventType::EXIT_SCOPE });
+		PushEvent(ProfilerEventType::EXIT_SCOPE);
 	}
 	void ProfilerComponent::BeginTick()
 	{
-		PushEvent({ fx::ProfilerEventType::BEGIN_TICK });
+		PushEvent(fx::ProfilerEventType::BEGIN_TICK);
 		EnterScope("Resource Tick");
 
 		if (--m_frames == 0) { ProfilerComponent::StopRecording(); }
@@ -547,7 +544,7 @@ namespace fx {
 	void ProfilerComponent::EndTick()
 	{
 		ExitScope();
-		PushEvent({ fx::ProfilerEventType::END_TICK, "", m_screenshot });
+		PushEvent(fx::ProfilerEventType::END_TICK, "", m_screenshot);
 	}
 	
 	void ProfilerComponent::StartRecording(const int frames)
@@ -555,14 +552,16 @@ namespace fx {
 		m_offset = fx::usec();
 		m_frames = frames;
 		m_recording = true;
+		g_recordProfilerTime = true;
 		m_events = {};
 	}
 	void ProfilerComponent::StopRecording()
 	{
 		m_recording = false;
+		g_recordProfilerTime = false;
 	}
 
-	auto ProfilerComponent::Get() -> const std::vector<ProfilerEvent>&
+	auto ProfilerComponent::Get() -> const tbb::concurrent_vector<ProfilerEvent>&
 	{
 		return m_events;
 	}

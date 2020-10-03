@@ -12,6 +12,7 @@
 #include <ICoreGameInit.h>
 #include <CoreConsole.h>
 #include <LaunchMode.h>
+#include <CrossBuildRuntime.h>
 #include <utf8.h>
 
 #include "memdbgon.h"
@@ -149,18 +150,19 @@ void GtaGameInterface::DrawIndexedVertices(int numVertices, int numIndices, Font
 	d3dDevice->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
 #endif
 
+	/*for (int i = 0; i < numVertices; i++)
+	{
+		trace("before: %f %f\n", vertices[i].x, vertices[i].y);
+		TransformToScreenSpace((float*)&vertices[i], 1);
+		trace("aft: %f %f\n", vertices[i].x, vertices[i].y);
+	}*/
+
 	rage::grcBegin(3, numIndices);
 
 	for (int j = 0; j < numIndices; j++)
 	{
 		auto vertex = &vertices[indices[j]];
 		uint32_t color = *(uint32_t*)&vertex->color;
-
-		// this swaps ABGR (as CRGBA is ABGR in little-endian) to ARGB by rotating left
-		if (!rage::grcTexture::IsRenderSystemColorSwapped())
-		{
-			color = (color & 0xFF00FF00) | _rotl(color & 0x00FF00FF, 16);
-		}
 
 		rage::grcVertex(vertex->x, vertex->y, 0.0, 0.0, 0.0, -1.0, color, vertex->u, vertex->v);
 	}
@@ -286,6 +288,16 @@ FontRendererGameInterface* CreateGameInterface()
 
 #include <random>
 
+static bool IsCanary()
+{
+	wchar_t resultPath[1024];
+
+	static std::wstring fpath = MakeRelativeCitPath(L"CitizenFX.ini");
+	GetPrivateProfileString(L"Game", L"UpdateChannel", L"production", resultPath, std::size(resultPath), fpath.c_str());
+
+	return (_wcsicmp(resultPath, L"canary") == 0);
+}
+
 static InitFunction initFunction([] ()
 {
 	static ConVar<std::string> customBrandingEmoji("ui_customBrandingEmoji", ConVar_Archive, "");
@@ -312,7 +324,7 @@ static InitFunction initFunction([] ()
 		shouldDraw = true;
 	}
 
-#ifdef _HAVE_GRCORE_NEWSTATES
+#if defined(_HAVE_GRCORE_NEWSTATES) && defined(GTA_FIVE)
 	OnGrcCreateDevice.Connect([] ()
 	{
 		D3D11_SAMPLER_DESC samplerDesc = CD3D11_SAMPLER_DESC(CD3D11_DEFAULT());
@@ -321,21 +333,32 @@ static InitFunction initFunction([] ()
 
 		g_gtaGameInterface.SetPointSamplerState(CreateSamplerState(&samplerDesc));
 	});
+#elif defined(IS_RDR3)
+	OnGrcCreateDevice.Connect([]()
+	{
+		g_gtaGameInterface.SetPointSamplerState(GetStockStateIdentifier(SamplerStatePoint));
+	});
 #endif
+
+	srand(GetTickCount());
 
 	OnPostFrontendRender.Connect([=] ()
 	{
-#if defined(GTA_FIVE)
-		int x, y;
-		GetGameResolution(x, y);
+#if defined(GTA_FIVE) || defined(IS_RDR3)
+		int gameWidth, gameHeight;
+		GetGameResolution(gameWidth, gameHeight);
+
+		static bool isCanary = IsCanary();
 
 		std::wstring brandingString = L"";
+		std::wstring brandingEmoji = L"";
+		std::wstring brandName = L"";
 
 		if (shouldDraw) {
 			SYSTEMTIME systemTime;
 			GetLocalTime(&systemTime);
 
-			std::wstring brandingEmoji;
+			brandName = L"FiveM";
 
 			switch (systemTime.wHour)
 			{
@@ -373,10 +396,9 @@ static InitFunction initFunction([] ()
 					break;
 			}
 
-			std::wstring_view brandName = L"FiveM";
-
 			if (!CfxIsSinglePlayer() && !getenv("CitizenFX_ToolMode"))
 			{
+#if !defined(IS_RDR3)
 				auto emoji = customBrandingEmoji.GetValue();
 
 				if (!emoji.empty())
@@ -404,24 +426,74 @@ static InitFunction initFunction([] ()
 
 				if (Instance<ICoreGameInit>::Get()->OneSyncEnabled)
 				{
-					brandName = L"FiveM/OneSync-ALPHA";
+					brandName += L"*";
+				}
+
+				if (Is2060())
+				{
+					brandName += L" (b2060)";
+				}
+#endif
+
+#if defined(IS_RDR3)
+				brandName = L"RedM MILESTONE 2";
+#endif
+
+				if (isCanary)
+				{
+					brandName += L" (Canary)";
 				}
 			}
+		}
 
+		std::random_device rd;
+		std::mt19937 gen(rd());
+		std::uniform_int_distribution<> dis(0, 2);
+
+		static int anchorPos = dis(gen);
+
+		// If anchor position is on left-side, make the emoji go on the left side.
+		if (anchorPos < 2) {
 			brandingString = fmt::sprintf(L"%s %s", brandName, brandingEmoji);
-		}
-
-		static CRect metrics;
-		
-		if (metrics.Width() <= 0.1f)
+		} else
 		{
-			g_fontRenderer.GetStringMetrics(brandingString, 22.0f, 1.0f, "Segoe UI", metrics);
+			brandingString = fmt::sprintf(L"%s %s", brandingEmoji, brandName);
 		}
 
-		CRect drawRect(x - metrics.Width() - 10.0f, 10.0f, x, y);
-		CRGBA color(180, 180, 180);
+		
+		static CRect metrics;
+		static fwWString lastString;
+		static float lastHeight;
 
-		g_fontRenderer.DrawText(brandingString, drawRect, color, 22.0f, 1.0f, "Segoe UI");
+		float gameWidthF = static_cast<float>(gameWidth);
+		float gameHeightF = static_cast<float>(gameHeight);
+		
+		if (metrics.Width() <= 0.1f || lastString != brandingString || lastHeight != gameHeightF)
+		{
+			g_fontRenderer.GetStringMetrics(brandingString, 22.0f * (gameHeightF / 1440.0f), 1.0f, "Segoe UI", metrics);
+
+			lastString = brandingString;
+			lastHeight = gameHeightF;
+		}
+
+		CRect drawRect;
+
+		switch (anchorPos)
+		{
+		case 0: // TR
+			drawRect = { gameWidthF - metrics.Width() - 10.0f, 10.0f, gameWidthF, gameHeightF };
+			break;
+		case 1: // BR
+			drawRect = { gameWidthF - metrics.Width() - 10.0f, gameHeightF - metrics.Height() - 10.0f, gameWidthF, gameHeightF };
+			break;
+		case 2: // TL
+			drawRect = { 10.0f, 10.0f, gameWidthF, gameHeightF };
+			break;
+		}
+
+		CRGBA color(180, 180, 180, 120);
+
+		g_fontRenderer.DrawText(brandingString, drawRect, color, 22.0f * (gameHeightF / 1440.0f), 1.0f, "Segoe UI");
 #endif
 
 		g_fontRenderer.DrawPerFrame();

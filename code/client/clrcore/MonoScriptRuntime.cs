@@ -52,6 +52,14 @@ namespace CitizenFX.Core
 
 					basePath = Native.API.GetResourcePath(resourceName);
 					useTaskScheduler = Native.API.GetNumResourceMetadata(resourceName, "clr_disable_task_scheduler") == 0;
+
+					if (host is IScriptHostWithManifest manifestHost)
+					{
+						if (manifestHost.IsManifestVersionV2Between("bodacious", ""))
+						{
+							useTaskScheduler = false;
+						}
+					}
 				}
 #endif
 
@@ -119,7 +127,8 @@ namespace CitizenFX.Core
 			return m_instanceId;
 		}
 
-		public int HandlesFile(string filename)
+		[SecuritySafeCritical]
+		public int HandlesFile(string filename, IScriptHostWithResourceData metadata)
 		{
 			return (filename.EndsWith(".net.dll") ? 1 : 0);
 		}
@@ -383,6 +392,11 @@ namespace CitizenFX.Core
 			public void SubmitBoundaryEnd(byte[] d, int l)
 			{
 				m_realHost.SubmitBoundaryEnd(d, l);
+			}
+
+			public IntPtr GetLastErrorText()
+			{
+				return m_realHost.GetLastErrorText();
 			}
 
 			[SecurityCritical]

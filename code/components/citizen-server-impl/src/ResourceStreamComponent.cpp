@@ -2,6 +2,7 @@
 #include <ResourceStreamComponent.h>
 
 #include <VFSManager.h>
+#include <VFSLinkExtension.h>
 
 #include <ResourceFileDatabase.h>
 
@@ -114,25 +115,73 @@ namespace fx
 
 		size_t numEntries = stream->GetLength() / sizeof(Entry);
 
-		std::vector<Entry> entries(numEntries);
-		stream->Read(&entries[0], entries.size() * sizeof(Entry));
-
-		for (auto& entry : entries)
+		if (numEntries > 0)
 		{
-			if (!vfs::OpenRead(entry.onDiskPath).GetRef())
+			std::vector<Entry> entries(numEntries);
+			stream->Read(&entries[0], entries.size() * sizeof(Entry));
+
+			for (auto& entry : entries)
 			{
-				return true;
+				if (!vfs::OpenRead(entry.onDiskPath).GetRef())
+				{
+					return true;
+				}
 			}
 		}
 
 		return false;
 	}
 
+	static void MakeSymLink(const std::string& cacheRoot, ResourceStreamComponent::RuntimeEntry* file)
+	{
+		auto device = vfs::GetDevice(cacheRoot);
+		device->CreateDirectory(cacheRoot);
+
+		auto h = device->Create(cacheRoot + "these files are hardlinks - they do not take up any disk space by themselves.txt");
+
+		if (h != vfs::Device::InvalidHandle)
+		{
+			device->Close(h);
+		}
+
+		vfs::MakeHardLinkExtension cd;
+		cd.existingPath = file->onDiskPath;
+		cd.newPath = cacheRoot + "z" + file->hashString;
+
+		bool madeLink = device->ExtensionCtl(VFS_MAKE_HARDLINK, &cd, sizeof(cd));
+
+		if (madeLink)
+		{
+			file->loadDiskPath = cd.newPath;
+		}
+		else
+		{
+			static bool warned = false;
+
+			if (!warned)
+			{
+				trace("^3Could not make hard link for %s <-> %s.^7\n", cd.existingPath, cd.newPath);
+
+				warned = true;
+			}
+		}
+	}
+
 	bool ResourceStreamComponent::UpdateSet()
 	{
+		// set up variables
+		std::string outFileName = fmt::sprintf("cache:/files/%s/resource.sfl", m_resource->GetName());
+		auto sflRoot = outFileName.substr(0, outFileName.find_last_of('/'));
+		auto cacheRoot = sflRoot + "/stream_cache/";
+
+		// create output directory
+		fwRefContainer<vfs::Device> device = vfs::GetDevice(outFileName);
+		device->CreateDirectory(sflRoot);
+
+		// look at files
 		std::vector<std::string> files;
 
-		IterateRecursively(fmt::sprintf("%s/stream/", m_resource->GetPath()), [&](const std::string& fullPath)
+		IterateRecursively(fmt::sprintf("%s/stream/", m_resource->GetPath()), [this, device, &cacheRoot, &files](const std::string& fullPath)
 		{
 			files.push_back(fullPath);
 
@@ -141,15 +190,39 @@ namespace fx
 			if (file)
 			{
 				file->isAutoScan = true;
+
+				MakeSymLink(cacheRoot, file);
 			}
 		});
 
-		std::string outFileName = fmt::sprintf("cache:/files/%s/resource.sfl", m_resource->GetName());
+		// remove hard links for missing files
+		{
+			vfs::FindData fd;
+			auto handle = device->FindFirst(cacheRoot, &fd);
 
-		fwRefContainer<vfs::Device> device = vfs::GetDevice(outFileName);
-		device->CreateDirectory(outFileName.substr(0, outFileName.find_last_of('/')));
+			if (handle != INVALID_DEVICE_HANDLE)
+			{
+				do 
+				{
+					if (!(fd.attributes & FILE_ATTRIBUTE_DIRECTORY))
+					{
+						if (fd.name.length() == 41 && fd.name[0] == 'z')
+						{
+							auto hash = fd.name.substr(1);
 
-		// first, save the resource database
+							if (m_hashPairs.find(hash) == m_hashPairs.end())
+							{
+								device->RemoveFile(cacheRoot + fd.name);
+							}
+						}
+					}
+				} while (device->FindNext(handle, &fd));
+
+				device->FindClose(handle);
+			}
+		}
+
+		// save the resource database
 		{
 			auto dbName = outFileName + ".db";
 			auto setDatabase = std::make_shared<ResourceFileDatabase>();
@@ -183,7 +256,9 @@ namespace fx
 		return true;
 	}
 
-	auto ResourceStreamComponent::AddStreamingFile(const std::string& fullPath) -> StorageEntry*
+	uint32_t ConvertRSC7Size(uint32_t flags);
+
+	auto ResourceStreamComponent::AddStreamingFile(const std::string& fullPath) -> RuntimeEntry*
 	{
 		if (fullPath.find(".stream_raw") != std::string::npos)
 		{
@@ -226,6 +301,15 @@ namespace fx
 				entry.rscPagesPhysical = rsc7Header.physPages;
 				entry.rscPagesVirtual = rsc7Header.virtPages;
 				entry.isResource = true;
+
+				ValidateSize(entry.entryName, ConvertRSC7Size(rsc7Header.physPages), ConvertRSC7Size(rsc7Header.virtPages));
+			}
+			else if (rsc7Header.magic == 0x05435352) // RSC\x05
+			{
+				entry.rscVersion = rsc7Header.version;
+				entry.rscPagesVirtual = rsc7Header.virtPages;
+				entry.rscPagesPhysical = rsc7Header.version;
+				entry.isResource = true;
 			}
 
 			rscStream->Seek(0, SEEK_SET);
@@ -259,7 +343,7 @@ namespace fx
 	{
 		auto json = nlohmann::json::object({
 			{ "hash", this->hashString },
-			{"isResource", this->isResource },
+			{ "isResource", this->isResource },
 			{ "rscPagesPhysical", this->rscPagesPhysical},
 			{ "rscPagesVirtual", this->rscPagesVirtual},
 			{ "rscVersion", this->rscVersion},
@@ -269,7 +353,7 @@ namespace fx
 		return json.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
 	}
 
-	auto ResourceStreamComponent::AddStreamingFile(const std::string& entryName, const std::string& diskPath, const std::string& cacheString) -> StorageEntry*
+	auto ResourceStreamComponent::AddStreamingFile(const std::string& entryName, const std::string& diskPath, const std::string& cacheString) -> RuntimeEntry*
 	{
 		try
 		{
@@ -297,12 +381,69 @@ namespace fx
 		return nullptr;
 	}
 
-	auto ResourceStreamComponent::AddStreamingFile(const Entry& entry) -> StorageEntry*
+	uint32_t ConvertRSC7Size(uint32_t flags)
 	{
-		StorageEntry se(entry);
+		auto s0 = ((flags >> 27) & 0x1) << 0; // 1 bit  - 27        (*1)
+		auto s1 = ((flags >> 26) & 0x1) << 1; // 1 bit  - 26        (*2)
+		auto s2 = ((flags >> 25) & 0x1) << 2; // 1 bit  - 25        (*4)
+		auto s3 = ((flags >> 24) & 0x1) << 3; // 1 bit  - 24        (*8)
+		auto s4 = ((flags >> 17) & 0x7F) << 4; // 7 bits - 17 - 23   (*16)   (max 127 * 16)
+		auto s5 = ((flags >> 11) & 0x3F) << 5; // 6 bits - 11 - 16   (*32)   (max 63  * 32)
+		auto s6 = ((flags >> 7) & 0xF) << 6; // 4 bits - 7  - 10   (*64)   (max 15  * 64)
+		auto s7 = ((flags >> 5) & 0x3) << 7; // 2 bits - 5  - 6    (*128)  (max 3   * 128)
+		auto s8 = ((flags >> 4) & 0x1) << 8; // 1 bit  - 4         (*256)
+		auto ss = ((flags >> 0) & 0xF); // 4 bits - 0  - 3
+		auto baseSize = 0x200 << (uint32_t)ss;
+		auto size = baseSize * (s0 + s1 + s2 + s3 + s4 + s5 + s6 + s7 + s8);
+		return (uint32_t)size;
+	}
+
+	void ResourceStreamComponent::ValidateSize(std::string_view name, uint32_t physSize, uint32_t virtSize)
+	{
+		auto checkSize = [&name, this](uint32_t size, std::string_view why)
+		{
+			auto divSize = fmt::sprintf("%.1f", size / 1024.0 / 1024.0);
+			int warnColor = 0;
+
+			if (size > (64 * 1024 * 1024))
+			{
+				warnColor = 1;
+			}
+			else if (size > (32 * 1024 * 1024))
+			{
+				warnColor = 3;
+			}
+			else if (size > (16 * 1024 * 1024))
+			{
+				warnColor = 4;
+			}
+
+			if (warnColor != 0)
+			{
+				trace("^%dAsset %s/%s uses %s MiB of %s memory.%s^7\n", warnColor, m_resource->GetName(), name, divSize, why,
+					(size > (48 * 1024 * 1024))
+						? " Oversized assets can and WILL lead to streaming issues (models not loading/rendering, commonly known as 'texture loss', 'city bug' or 'streaming isn't great')."
+						: "");
+			}
+		};
+
+		checkSize(physSize, "physical");
+		checkSize(virtSize, "virtual");
+	}
+
+	auto ResourceStreamComponent::AddStreamingFile(const Entry& entry) -> RuntimeEntry*
+	{
+		RuntimeEntry se(entry);
 		se.isAutoScan = false;
 
+		if (entry.isResource /* && gamename == gta5? */)
+		{
+			ValidateSize(entry.entryName, ConvertRSC7Size(entry.rscPagesPhysical), ConvertRSC7Size(entry.rscPagesVirtual));
+		}
+
 		auto it = m_resourcePairs.insert({ entry.entryName, se }).first;
+		m_hashPairs[se.hashString] = &it->second;
+
 		return &it->second;
 	}
 
@@ -319,21 +460,27 @@ namespace fx
 			else
 			{
 				fwRefContainer<vfs::Stream> stream = vfs::OpenRead(fmt::sprintf("cache:/files/%s/resource.sfl", m_resource->GetName()));
+				auto cacheRoot = fmt::sprintf("cache:/files/%s/stream_cache/", m_resource->GetName());
 
 				if (stream.GetRef())
 				{
 					size_t numEntries = stream->GetLength() / sizeof(Entry);
 
-					std::vector<Entry> entries(numEntries);
-					stream->Read(&entries[0], entries.size() * sizeof(Entry));
-
-					for (auto& entry : entries)
+					if (numEntries)
 					{
-						auto file = AddStreamingFile(entry);
+						std::vector<Entry> entries(numEntries);
+						stream->Read(&entries[0], entries.size() * sizeof(Entry));
 
-						if (file)
+						for (auto& entry : entries)
 						{
-							file->isAutoScan = true;
+							auto file = AddStreamingFile(entry);
+
+							if (file)
+							{
+								file->isAutoScan = true;
+
+								MakeSymLink(cacheRoot, file);
+							}
 						}
 					}
 				}

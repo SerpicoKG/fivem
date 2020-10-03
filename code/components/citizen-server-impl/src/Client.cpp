@@ -28,6 +28,8 @@ namespace fx
 		m_netId = netId;
 
 		OnAssignNetId();
+
+		UpdateCachedPrincipalValues();
 	}
 
 	void Client::SetTcpEndPoint(const std::string& value)
@@ -69,7 +71,7 @@ namespace fx
 
 		if (it == m_userData.end())
 		{
-			static const std::any emptyAny;
+			static const std::any& emptyAny = *new std::any();
 			return emptyAny;
 		}
 
@@ -80,7 +82,7 @@ namespace fx
 	{
 		if (m_peer)
 		{
-			gscomms_send_packet(shared_from_this(), *m_peer, channel, buffer, type);
+			gscomms_send_packet(this, *m_peer, channel, buffer, type);
 		}
 	}
 }

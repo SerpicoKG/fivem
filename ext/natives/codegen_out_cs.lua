@@ -289,11 +289,11 @@ local function formatWrapper(native, fnName)
 	return body
 end
 
-local function formatImpl(native)
+local function formatImpl(native, baseAppendix)
 	local t = '\t\t\t'
 	local body = ''
 	
-	local nativeName = printFunctionName(native)
+	local nativeName = printFunctionName(native) .. baseAppendix
 	local args, argsDefs, nativeArgs = formatArgs(native)
 
 	body = body .. '(' .. table.concat(argsDefs, ', ') .. ')\n'
@@ -399,6 +399,8 @@ local function formatImpl(native)
 			elseif type == 'string' then
 				body = body .. t .. '\tcxt->numArguments = ' .. tostring(argn - 1) .. ';\n'
 				body = body .. t .. '\tScriptContext.PushString(cxt, ' .. name .. ');\n'
+			elseif type == 'Vector3' then
+				body = body .. t .. '\t*(NativeVector3*)(&_fnPtr[' .. numArgs .. ']) = ' .. val .. ';\n'
 			else
 				-- assuming float is safe as only doing 32 bit reads?
 				if type ~= 'float' and type ~= 'System.IntPtr' then
@@ -431,8 +433,9 @@ local function formatImpl(native)
 		body = body .. t .. '\tcxt->functionDataPtr = _fnPtr;\n'
 		body = body .. t .. '\tcxt->retDataPtr = _fnPtr;\n'
 		body = body .. t .. ("\tvar invv = m_invoker%s;\n"):format(nativeName)
+		body = body .. t .. ("\tbyte* error = null;\n"):format(nativeName)
 		body = body .. t .. ("\tif (invv == null) m_invoker%s = invv = ScriptContext.DoGetNative(%s);\n"):format(nativeName, native.hash)
-		body = body .. t .. ("\tinvv(cxt);\n")
+		body = body .. t .. ("\tif (!invv(cxt, (void**)&error)) { throw new System.InvalidOperationException(ScriptContext.ErrorHandler(error)); }\n")
 		body = body .. "#endif\n"
 	end
 	
@@ -474,7 +477,7 @@ local function printNative(native)
 	local baseAppendix = appendix
 
 	local doc = formatDocString(native)
-	local retType, def, hyperDriveSafe = formatImpl(native)
+	local retType, def, hyperDriveSafe = formatImpl(native, baseAppendix)
 	local wrapper = formatWrapper(native, 'Internal' .. nativeName .. baseAppendix)
 
 	local str = string.format("%s\t\t[System.Security.SecuritySafeCritical]\n\t\tpublic static %s %s%s", doc, retType, nativeName .. appendix, wrapper)
@@ -496,7 +499,7 @@ local function printNative(native)
 	
 	str = str .. string.format("\t\t[System.Security.SecurityCritical]\n\t\tprivate static unsafe %s Internal%s%s", retType, nativeName .. baseAppendix, def)	
 	if hyperDriveSafe then
-		str = str .. string.format("\n#if USE_HYPERDRIVE\n\t\tprivate static ScriptContext.CallFunc m_invoker%s;\n#endif\n", nativeName);
+		str = str .. string.format("\n#if USE_HYPERDRIVE\n\t\tprivate static ScriptContext.CallFunc m_invoker%s;\n#endif\n", nativeName .. baseAppendix);
 	end	
 	return str
 end

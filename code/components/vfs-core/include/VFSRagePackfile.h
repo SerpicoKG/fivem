@@ -79,6 +79,8 @@ namespace vfs
 
 		void FillFindData(FindData* data, const Entry* entry);
 
+		size_t GetLengthForHandle(THandle handle);
+
 	public:
 		RagePackfile();
 
@@ -112,5 +114,7 @@ namespace vfs
 
 	public:
 		bool OpenArchive(const std::string& archivePath);
+
+		bool OpenArchive(const std::string& archivePath, std::string* errorState);
 	};
 }

@@ -29,7 +29,7 @@ namespace net
 			fwRefContainer<ReverseTcpServerStream> selfRef = *refRef;
 
 			// dequeue pending writes
-			std::function<void()> request;
+			TScheduledCallback request;
 
 			while (selfRef->m_pendingRequests.try_pop(request))
 			{
@@ -48,16 +48,24 @@ namespace net
 		
 	}
 
-	void ReverseTcpServerStream::Write(const std::vector<uint8_t>& data)
+	void ReverseTcpServerStream::Write(const std::vector<uint8_t>& data, TCompleteCallback&& onComplete)
 	{
 		auto worker = m_tcp.lock();
 
 		if (worker)
 		{
-			m_pendingRequests.push([worker, data]()
+			m_pendingRequests.push([worker, data, onComplete = std::move(onComplete)]() mutable
 			{
 				std::unique_ptr<char[]> msg{ new char[data.size()] };
 				memcpy(msg.get(), data.data(), data.size());
+
+				if (onComplete)
+				{
+					worker->once<uvw::WriteEvent>(make_shared_function([onComplete = std::move(onComplete)](const uvw::WriteEvent& e, uvw::TCPHandle& h) mutable
+					{
+						onComplete(true);
+					}));
+				}
 
 				worker->write(std::move(msg), data.size());
 			});
@@ -66,9 +74,9 @@ namespace net
 		}
 	}
 
-	void ReverseTcpServerStream::ScheduleCallback(const TScheduledCallback& callback)
+	void ReverseTcpServerStream::ScheduleCallback(TScheduledCallback&& callback, bool performInline)
 	{
-		m_pendingRequests.push(callback);
+		m_pendingRequests.push(std::move(callback));
 		m_writeCallback->send();
 	}
 
@@ -132,7 +140,7 @@ namespace net
 
 	void MessageHandler::WriteMessage(uvw::TCPHandle& tcp, const json& json)
 	{
-		auto jsonDump = json.dump();
+		auto jsonDump = json.dump(-1, ' ', false, nlohmann::detail::error_handler_t::replace);
 
 		size_t len = jsonDump.length() + sizeof(uint32_t);
 		std::unique_ptr<char[]> msg{ new char[len] };
@@ -281,7 +289,13 @@ namespace net
 				if (worker)
 				{
 					fwRefContainer<ReverseTcpServerStream> stream{ new ReverseTcpServerStream(thisRef.GetRef(), worker) };
-					stream->m_remotePeerAddress = *net::PeerAddress::FromString(message[1].value("address", "127.0.0.1:65535"));
+
+					auto address = net::PeerAddress::FromString(message[1].value("address", "127.0.0.1:65535"), 30120, net::PeerAddress::LookupType::NoResolution);
+
+					if (address)
+					{
+						stream->m_remotePeerAddress = *address;
+					}
 
 					thisRef->m_streams[worker] = stream;
 
@@ -314,6 +328,7 @@ namespace net
 			thisRef->RemoveWorker(weakWorker.lock());
 		});
 
+		worker->keepAlive(true, std::chrono::duration<unsigned int>{5});
 		worker->connect(*m_curRemote.GetSocketAddress());
 
 		m_work.insert(worker);
@@ -432,6 +447,7 @@ namespace net
 			thisRef->m_reconnectTimer->start(2500ms, 0ms);
 		});
 
+		m_control->keepAlive(true, std::chrono::duration<unsigned int>{5});
 		m_control->connect(*peer->GetSocketAddress());
 		m_curRemote = *peer;
 	}

@@ -8,11 +8,14 @@
 #include <ResourceManager.h>
 #include <Profiler.h>
 
+#include <GameServer.h>
 #include <VFSManager.h>
 
 #include <botan/base64.h>
 
 #include <json.hpp>
+
+#include <KeyedRateLimiter.h>
 
 #include <cfx_version.h>
 #include <optional>
@@ -39,7 +42,7 @@ static InitFunction initFunction([]()
 		{
 			*(volatile int*)0 = 0;
 		});
-		auto epPrivacy = instance->AddVariable<bool>("sv_endpointPrivacy", ConVar_None, false);
+		auto epPrivacy = instance->AddVariable<bool>("sv_endpointPrivacy", ConVar_None, true);
 
 		// max clients cap
 		maxClientsVar->GetHelper()->SetConstraints(1, MAX_CLIENTS);
@@ -48,6 +51,9 @@ static InitFunction initFunction([]()
 		{
 			json infoJson;
 			std::recursive_mutex infoJsonMutex;
+
+			std::string infoJsonStr;
+			std::shared_mutex infoJsonStrMutex;
 			int infoHash;
 
 			InfoData()
@@ -58,50 +64,58 @@ static InitFunction initFunction([]()
 
 			void Update()
 			{
-				std::unique_lock<std::recursive_mutex> lock(infoJsonMutex);
-
-				auto varman = instanceRef->GetComponent<console::Context>()->GetVariableManager();
-
-				infoJson["vars"] = json::object();
-
-				varman->ForAllVariables([&](const std::string& name, int flags, const std::shared_ptr<internal::ConsoleVariableEntryBase>& var)
+				if (infoJsonMutex.try_lock())
 				{
-					// don't return more variable information
-					if (name == "sv_infoVersion" || name == "sv_hostname")
+					auto varman = instanceRef->GetComponent<console::Context>()->GetVariableManager();
+
+					infoJson["vars"] = json::object();
+
+					varman->ForAllVariables([&](const std::string& name, int flags, const std::shared_ptr<internal::ConsoleVariableEntryBase>& var)
 					{
-						return;
+						// don't return more variable information
+						if (name == "sv_infoVersion" || name == "sv_hostname")
+						{
+							return;
+						}
+
+						infoJson["vars"][name] = var->GetValue();
+					}, ConVar_ServerInfo);
+
+					infoJson["resources"] = json::array();
+					infoJson["resources"].push_back("hardcap");
+
+					auto resman = instanceRef->GetComponent<fx::ResourceManager>();
+					resman->ForAllResources([&](fwRefContainer<fx::Resource> resource)
+					{
+						// we've already listed hardcap, no need to actually return it again
+						if (resource->GetName() == "hardcap")
+						{
+							return;
+						}
+
+						// only output started resources
+						if (resource->GetState() != fx::ResourceState::Started)
+						{
+							return;
+						}
+
+						infoJson["resources"].push_back(resource->GetName());
+					});
+
+					infoJson["version"] = 0;
+
+					infoHash = static_cast<int>(HashRageString(infoJson.dump(-1, ' ', false, json::error_handler_t::replace).c_str()) & 0x7FFFFFFF);
+					infoJson["version"] = infoHash;
+
+					ivVar->GetHelper()->SetRawValue(infoHash);
+
+					{
+						std::lock_guard<std::shared_mutex> _(infoJsonStrMutex);
+						infoJsonStr = infoJson.dump(-1, ' ', false, json::error_handler_t::replace);
 					}
 
-					infoJson["vars"][name] = var->GetValue();
-				}, ConVar_ServerInfo);
-
-				infoJson["resources"] = json::array();
-				infoJson["resources"].push_back("hardcap");
-
-				auto resman = instanceRef->GetComponent<fx::ResourceManager>();
-				resman->ForAllResources([&](fwRefContainer<fx::Resource> resource)
-				{
-					// we've already listed hardcap, no need to actually return it again
-					if (resource->GetName() == "hardcap")
-					{
-						return;
-					}
-
-					// only output started resources
-					if (resource->GetState() != fx::ResourceState::Started)
-					{
-						return;
-					}
-
-					infoJson["resources"].push_back(resource->GetName());
-				});
-
-				infoJson["version"] = 0;
-
-				infoHash = static_cast<int>(HashRageString(infoJson.dump(-1, ' ', false, json::error_handler_t::replace).c_str()) & 0x7FFFFFFF);
-				infoJson["version"] = infoHash;
-
-				ivVar->GetHelper()->SetRawValue(infoHash);
+					infoJsonMutex.unlock();
+				}
 			}
 		};
 
@@ -185,21 +199,103 @@ static InitFunction initFunction([]()
 
 		instance->GetComponent<fx::HttpServerManager>()->AddEndpoint("/info.json", [=](const fwRefContainer<net::HttpRequest>& request, const fwRefContainer<net::HttpResponse>& response)
 		{
+			static auto limiter = instance->GetComponent<fx::PeerAddressRateLimiterStore>()->GetRateLimiter("http_info", fx::RateLimiterDefaults{ 4.0, 10.0 });
+			auto address = net::PeerAddress::FromString(request->GetRemoteAddress(), 30120, net::PeerAddress::LookupType::NoResolution);
+
+			bool cooldown = false;
+
+			if (address && !limiter->Consume(*address, 1.0, &cooldown))
+			{
+				if (cooldown)
+				{
+					response->CloseSocket();
+					return;
+				}
+
+				response->SetStatusCode(429);
+				response->End("Rate limit exceeded.");
+				return;
+			}
+
 			infoData->Update();
 
 			{
-				std::unique_lock<std::recursive_mutex> lock(infoData->infoJsonMutex);
-				response->End(infoData->infoJson.dump(-1, ' ', false, json::error_handler_t::replace));
+				std::shared_lock<std::shared_mutex> lock(infoData->infoJsonStrMutex);
+				response->End(infoData->infoJsonStr);
 			}
 		});
 
-		instance->GetComponent<fx::HttpServerManager>()->AddEndpoint("/players.json", [=](const fwRefContainer<net::HttpRequest>& request, const fwRefContainer<net::HttpResponse>& response)
+		instance->GetComponent<fx::HttpServerManager>()->AddEndpoint("/dynamic.json", [=](const fwRefContainer<net::HttpRequest>& request, const fwRefContainer<net::HttpResponse>& response)
 		{
+			auto server = instance->GetComponent<fx::GameServer>();
+
+			int numClients = 0;
+
+			instance->GetComponent<fx::ClientRegistry>()->ForAllClients([&](const fx::ClientSharedPtr& client)
+			{
+				if (client->GetNetId() < 0xFFFF)
+				{
+					++numClients;
+				}
+			});
+
+			auto json = json::object({
+				{ "hostname", server->GetVariable("sv_hostname") },
+				{ "gametype", server->GetVariable("gametype") },
+				{ "mapname", server->GetVariable("mapname") },
+				{ "clients", numClients },
+				{ "iv", server->GetVariable("sv_infoVersion") },
+				{ "sv_maxclients", server->GetVariable("sv_maxclients") },
+			});
+
+			response->End(json.dump(-1, ' ', false, json::error_handler_t::replace));
+		});
+
+		static std::shared_mutex playerBlobMutex;
+		static std::string playerBlob;
+
+		instance->GetComponent<fx::HttpServerManager>()->AddEndpoint("/players.json", [instance](const fwRefContainer<net::HttpRequest>& request, const fwRefContainer<net::HttpResponse>& response)
+		{
+			static auto limiter = instance->GetComponent<fx::PeerAddressRateLimiterStore>()->GetRateLimiter("http_players", fx::RateLimiterDefaults{ 4.0, 10.0 });
+			auto address = net::PeerAddress::FromString(request->GetRemoteAddress(), 30120, net::PeerAddress::LookupType::NoResolution);
+
+			bool cooldown = false;
+
+			if (address && !limiter->Consume(*address, 1.0, &cooldown))
+			{
+				if (cooldown)
+				{
+					response->CloseSocket();
+					return;
+				}
+
+				response->SetStatusCode(429);
+				response->End("Rate limit exceeded.");
+				return;
+			}
+
+			std::shared_lock<std::shared_mutex> lock(playerBlobMutex);
+			response->End(playerBlob);
+		});
+
+		static std::chrono::milliseconds nextPlayerUpdate;
+
+		instance->GetComponent<fx::GameServer>()->OnTick.Connect([instance, epPrivacy]()
+		{
+			auto now = msec();
+
+			if (now < nextPlayerUpdate)
+			{
+				return;
+			}
+
+			nextPlayerUpdate = now + 1s;
+
 			auto clientRegistry = instance->GetComponent<fx::ClientRegistry>();
 
 			json data = json::array();
 
-			clientRegistry->ForAllClients([&](const std::shared_ptr<fx::Client>& client)
+			clientRegistry->ForAllClients([&](const fx::ClientSharedPtr& client)
 			{
 				if (client->GetNetId() >= 0xFFFF)
 				{
@@ -220,18 +316,21 @@ static InitFunction initFunction([]()
 					identifiers.erase(newEnd, identifiers.end());
 				}
 
-				auto peer = gscomms_get_peer(client->GetPeer());
+				fx::NetPeerStackBuffer stackBuffer;
+				gscomms_get_peer(client->GetPeer(), stackBuffer);
+				auto peer = stackBuffer.GetBase();
 
 				data.push_back({
 					{ "endpoint", (showEP) ? client->GetAddress().ToString() : "127.0.0.1" },
 					{ "id", client->GetNetId() },
 					{ "identifiers", identifiers },
 					{ "name", client->GetName() },
-					{ "ping", peer.GetRef() ? peer->GetPing() : -1 }
+					{ "ping", peer ? peer->GetPing() : -1 }
 				});
 			});
 
-			response->End(data.dump(-1, ' ', false, json::error_handler_t::replace));
+			std::unique_lock<std::shared_mutex> lock(playerBlobMutex);
+			playerBlob = data.dump(-1, ' ', false, json::error_handler_t::replace);
 		});
 
 		static std::optional<json> lastProfile;

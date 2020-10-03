@@ -20,11 +20,24 @@ fwPlatformString GetAbsoluteCitPath()
 {
 	static fwPlatformString citizenPath;
 
-	if (!citizenPath.size())
+	bool installStateChanged = false;
+
+#ifndef IS_FXSERVER
+	static HostSharedData<CfxState> initState("CfxInitState");
+
+	static bool lastInstallState = initState->ranPastInstaller;
+
+	if (initState->ranPastInstaller != lastInstallState)
+	{
+		lastInstallState = initState->ranPastInstaller;
+
+		installStateChanged = true;
+	}
+#endif
+
+	if (!citizenPath.size() || installStateChanged)
 	{
 #ifndef IS_FXSERVER
-		static HostSharedData<CfxState> initState("CfxInitState");
-
 		citizenPath = initState->GetInitPath();
 
 		// is this a new install, if so, migrate to subdirectory-based Citizen
@@ -32,7 +45,11 @@ fwPlatformString GetAbsoluteCitPath()
 		{
 			if (GetFileAttributes((citizenPath + L"CoreRT.dll").c_str()) == INVALID_FILE_ATTRIBUTES)
 			{
+#ifdef IS_RDR3
+				if (!CreateDirectory((citizenPath + L"RedM.app").c_str(), nullptr))
+#else
 				if (!CreateDirectory((citizenPath + L"FiveM.app").c_str(), nullptr))
+#endif
 				{
 					DWORD error = GetLastError();
 
@@ -46,7 +63,12 @@ fwPlatformString GetAbsoluteCitPath()
 
 		// is this subdirectory-based Citizen? if so, append the subdirectory
 		{
-			std::wstring subPath = citizenPath + L"FiveM.app";
+			std::wstring subPath = citizenPath +
+#ifdef IS_RDR3
+				L"RedM.app";
+#else
+				L"FiveM.app";
+#endif
 
 			if (GetFileAttributes(subPath.c_str()) != INVALID_FILE_ATTRIBUTES)
 			{

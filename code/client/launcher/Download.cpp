@@ -7,6 +7,9 @@
 
 #include "StdInc.h"
 
+#ifdef LAUNCHER_PERSONALITY_MAIN
+#include <CfxLocale.h>
+
 // the maximum number of concurrent downloads
 #define MAX_CONCURRENT_DOWNLOADS 6
 
@@ -48,6 +51,8 @@ typedef struct download_s
 	FILE* fp[10];
 	bool compressed;
 	bool conditionalDL;
+	bool doneExternal;
+	bool successExternal;
 
 	bool writeToMemory;
 	std::stringstream memoryStream;
@@ -59,7 +64,7 @@ typedef struct download_s
 	lzma_stream strm;
 	uint8_t strmOut[65535];
 
-	char curlError[CURL_ERROR_SIZE];
+	char curlError[CURL_ERROR_SIZE * 4];
 } download_t;
 
 struct dlState
@@ -116,6 +121,16 @@ void CL_QueueDownload(const char* url, const char* file, int64_t size, bool comp
 
 void CL_QueueDownload(const char* url, const char* file, int64_t size, bool compressed, int segments)
 {
+	if (strcmp(url, "https://runtime.fivem.net/patches/GTA_V_Patch_1_0_1604_0.exe") == 0)
+	{
+		for (int i = 0; i <= 9; i++)
+		{
+			CL_QueueDownload(va("https://mirrors.fivem.net/emergency_mirror/GTAV1604.exe%02d", i), va("%s.%d", file, i), i == 9 ? 87584200 : 104857600, false, 1);
+		}
+
+		return;
+	}
+
 	auto downloadPtr = std::make_shared<download_t>();
 	auto& download = *downloadPtr.get();
 
@@ -204,7 +219,7 @@ void DL_UpdateGlobalProgress(size_t thisSize)
 
 	double percentage = ((double)(dls.doneTotalBytes / 1000) / (dls.totalBytes / 1000)) * 100.0;
 
-	UI_UpdateText(1, va(L"Downloaded %.2f/%.2f MB (%.0f%%, %.1f MB/s)", (dls.doneTotalBytes / 1000) / 1000.f, ((dls.totalBytes / 1000) / 1000.f), percentage, dls.bytesPerSecond / (double)1000000));
+	UI_UpdateText(1, va(gettext(L"Downloaded %.2f/%.2f MB (%.0f%%, %.1f MB/s)"), (dls.doneTotalBytes / 1000) / 1000.f, ((dls.totalBytes / 1000) / 1000.f), percentage, dls.bytesPerSecond / (double)1000000));
 
 	UI_UpdateProgress(percentage);
 }
@@ -266,10 +281,10 @@ size_t DL_WriteToFile(void *ptr, size_t size, size_t nmemb, download_t* download
 		dls.lastBytes = dls.completedSize;
 	}
 
-	DL_UpdateGlobalProgress(size * nmemb);
-
 	if ((GetTickCount() - dls.lastPoll) > 50)
 	{
+		DL_UpdateGlobalProgress(size * nmemb);
+
 		// poll message loop in case of file:// transfers or similar
 		MSG msg;
 		while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE))
@@ -279,6 +294,10 @@ size_t DL_WriteToFile(void *ptr, size_t size, size_t nmemb, download_t* download
 		}
 
 		dls.lastPoll = GetTickCount();
+	}
+	else
+	{
+		dls.doneTotalBytes += size * nmemb;
 	}
 
 	return written;
@@ -301,6 +320,146 @@ static int DL_CurlDebug(CURL *handle,
 	return 0;
 }
 
+struct IpfsLibrary
+{
+public:
+	IpfsLibrary()
+		: success(false)
+	{
+		assert(LoadLibrary(MakeRelativeCitPath(L"CoreRT.dll").c_str()));
+		hMod = LoadLibrary(MakeRelativeCitPath(L"ipfsdl.dll").c_str());
+
+		if (hMod)
+		{
+			ipfsdlInit = (decltype(ipfsdlInit))GetProcAddress(hMod, "ipfsdlInit");
+			ipfsdlExit = (decltype(ipfsdlExit))GetProcAddress(hMod, "ipfsdlExit");
+			ipfsdlPoll = (decltype(ipfsdlPoll))GetProcAddress(hMod, "ipfsdlPoll");
+			ipfsdlDownloadFile = (decltype(ipfsdlDownloadFile))GetProcAddress(hMod, "ipfsdlDownloadFile");
+
+			if (ipfsdlInit)
+			{
+				success = ipfsdlInit();
+			}
+		}
+	}
+
+	~IpfsLibrary()
+	{
+		ipfsdlExit();
+	}
+
+	bool DownloadFile(const char* url, const std::function<bool(const void*, size_t)>& cb, const std::function<void(const char*)>& done)
+	{
+		struct Cxt
+		{
+			std::function<bool(const void*, size_t)> cb;
+			std::function<void(const char*)> done;
+		};
+
+		auto cxt = new Cxt();
+		cxt->cb = cb;
+		cxt->done = done;
+
+		if (!ipfsdlDownloadFile(cxt, url, [](void* cxt, const void* data, size_t size)
+		{
+			return ((Cxt*)cxt)->cb(data, size);
+		}, [](void* cxt, const char* error)
+		{
+			auto cx = (Cxt*)cxt;
+			cx->done(error);
+
+			delete cx;
+		}))
+		{
+			delete cxt;
+			return false;
+		}
+
+		return true;
+	}
+
+	void Poll()
+	{
+		return ipfsdlPoll();
+	}
+
+	operator bool()
+	{
+		return hMod && ipfsdlInit && ipfsdlExit && ipfsdlDownloadFile && ipfsdlPoll && success;
+	}
+
+private:
+	using DownloadCb = bool(*)(void* cxt, const void* data, size_t size);
+	using FinishCb = void(*)(void* cxt, const char* error);
+
+	HMODULE hMod;
+	bool(*ipfsdlInit)();
+	bool(*ipfsdlExit)();
+	void(*ipfsdlPoll)();
+	bool(*ipfsdlDownloadFile)(void* cxt, const char* url, DownloadCb cb, FinishCb done);
+
+	bool success;
+};
+
+static IpfsLibrary* GetIpfsLib()
+{
+	static IpfsLibrary ipfsLib;
+
+	return &ipfsLib;
+}
+
+static bool StartIPFSDownload(download_t* download)
+{
+	auto& ipfsLib = *GetIpfsLib();
+
+	if (!ipfsLib)
+	{
+		return false;
+	}
+
+	download->doneExternal = false;
+	download->successExternal = false;
+
+	UI_UpdateText(1, gettext(L"Starting IPFS discovery...").c_str());
+
+	return ipfsLib.DownloadFile(download->url, [download](const void* data, size_t size)
+	{
+		if (DL_WriteToFile(const_cast<void*>(data), 1, size, download) != size)
+		{
+			return false;
+		}
+
+		return true;
+	}, [download](const char* error)
+	{
+		download->doneExternal = true;
+
+		if (!error)
+		{
+			download->successExternal = true;
+		}
+		else
+		{
+			strncpy(download->curlError, error, std::size(download->curlError));
+			download->curlError[std::size(download->curlError) - 1] = '\0';
+		}
+	});
+}
+
+static bool PollIPFS()
+{
+	auto& ipfsLib = *GetIpfsLib();
+
+	if (!ipfsLib)
+	{
+		return false;
+	}
+
+	ipfsLib.Poll();
+
+	return true;
+}
+
 bool DL_ProcessDownload()
 {
 	if (!dls.currentDownloads.size())
@@ -308,69 +467,168 @@ bool DL_ProcessDownload()
 		return true;
 	}
 
+	auto initDownload = [](download_t* download)
+	{
+		// build path stuff
+		char opath[256];
+		char tmpPath[256];
+		char tmpDir[256];
+		opath[0] = '\0';
+		strcat_s(opath, sizeof(opath), download->file);
+		strcpy_s(tmpPath, sizeof(tmpPath), opath);
+		strcat_s(tmpPath, sizeof(tmpPath), ".tmp");
+
+		for (char* p = tmpPath; *p; p++)
+		{
+			if (*p == '\\')
+			{
+				*p = '/';
+			}
+		}
+
+		download->opath = opath;
+		download->tmpPath = tmpPath;
+
+		// create the parent directory too
+		strncpy(tmpDir, tmpPath, sizeof(tmpDir));
+
+		char* slashPos = strrchr(tmpDir, '/');
+
+		if (slashPos)
+		{
+			slashPos[0] = '\0';
+			CreateDirectoryAnyDepth(tmpDir);
+		}
+
+		memset(&download->strm, 0, sizeof(download->strm));
+
+		download->writeToMemory = false;
+
+		// download adhesive.dll to memory to prevent partial write issues
+		if (strstr(opath, "adhesive.dll") != nullptr)
+		{
+			download->writeToMemory = true;
+		}
+
+		if (!download->writeToMemory)
+		{
+			FILE* fp = nullptr;
+
+			fp = _wfopen(ToWide(tmpPath).c_str(), L"wb");
+
+			if (!fp)
+			{
+				dls.isDownloading = false;
+				MessageBox(NULL, va(L"Unable to open %s for writing.", ToWide(opath).c_str()), L"Error", MB_OK | MB_ICONSTOP);
+
+				return false;
+			}
+
+			download->fp[0] = fp;
+		}
+
+		return true;
+	};
+
+	auto onSuccess = [](decltype(dls.currentDownloads.begin()) it)
+	{
+		auto download = *it;
+
+		std::wstring tmpPathWide = ToWide(download->tmpPath);
+		std::wstring opathWide = ToWide(download->opath);
+
+		if (DeleteFile(opathWide.c_str()) == 0)
+		{
+			if (GetLastError() != ERROR_FILE_NOT_FOUND)
+			{
+				MessageBoxA(NULL, va("Deleting old %s failed (err = %d) - make sure you don't have any existing FiveM processes running", download->url, GetLastError()), "Error", MB_OK | MB_ICONSTOP);
+
+				return false;
+			}
+		}
+
+		if (MoveFile(tmpPathWide.c_str(), opathWide.c_str()) == 0)
+		{
+			MessageBoxA(NULL, va("Moving of %s failed (err = %d) - make sure you don't have any existing FiveM processes running", download->url, GetLastError()), "Error", MB_OK | MB_ICONSTOP);
+			DeleteFile(tmpPathWide.c_str());
+
+			return false;
+		}
+
+		dls.completedDownloads++;
+
+		dls.currentDownloads.erase(it);
+
+		return true;
+	};
+
+	auto processIPFSDownload = [&initDownload, &onSuccess](download_t* download)
+	{
+		if (!download->curlHandles[0])
+		{
+			if (!initDownload(download))
+			{
+				return false;
+			}
+
+			download->curlHandles[0] = (CURL*)1;
+
+			if (!StartIPFSDownload(download))
+			{
+				return false;
+			}
+		}
+
+		PollIPFS();
+
+		if (download->doneExternal)
+		{
+			if (download->successExternal)
+			{
+				auto it = std::find_if(dls.currentDownloads.begin(), dls.currentDownloads.end(), [&](auto& d)
+				{
+					return (d.get() == download);
+				});
+
+				if (download->fp[0])
+				{
+					fclose(download->fp[0]);
+				}
+
+				if (!onSuccess(it))
+				{
+					return false;
+				}
+			}
+			else
+			{
+				std::wstring tmpPathWide = ToWide(download->tmpPath);
+
+				_wunlink(tmpPathWide.c_str());
+				MessageBoxA(NULL, va("Downloading of %s failed - %s", download->url, download->curlError), "Error", MB_OK | MB_ICONSTOP);
+
+				return false;
+			}
+		}
+
+		return true;
+	};
+
 	std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>, wchar_t> converter;
 
 	// create new handles if we don't have one yet
 	for (auto& download : dls.currentDownloads)
 	{
+		if (strncmp(download->url, "ipfs://", 7) == 0)
+		{
+			return processIPFSDownload(download.get());
+		}
+
 		if (!download->curlHandles[0])
 		{
-			// build path stuff
-			char opath[256];
-			char tmpPath[256];
-			char tmpDir[256];
-			opath[0] = '\0';
-			strcat_s(opath, sizeof(opath), download->file);
-			strcpy_s(tmpPath, sizeof(tmpPath), opath);
-			strcat_s(tmpPath, sizeof(tmpPath), ".tmp");
-
-			for (char* p = tmpPath; *p; p++)
+			if (!initDownload(download.get()))
 			{
-				if (*p == '\\')
-				{
-					*p = '/';
-				}
-			}
-
-			download->opath = opath;
-			download->tmpPath = tmpPath;
-
-			// create the parent directory too
-			strncpy(tmpDir, tmpPath, sizeof(tmpDir));
-
-			char* slashPos = strrchr(tmpDir, '/');
-
-			if (slashPos)
-			{
-				slashPos[0] = '\0';
-				CreateDirectoryAnyDepth(tmpDir);
-			}
-
-			memset(&download->strm, 0, sizeof(download->strm));
-
-			download->writeToMemory = false;
-
-			// download adhesive.dll to memory to prevent partial write issues
-			if (strstr(opath, "adhesive.dll") != nullptr)
-			{
-				download->writeToMemory = true;
-			}
-
-			if (!download->writeToMemory)
-			{
-				FILE* fp = nullptr;
-
-				fp = _wfopen(converter.from_bytes(tmpPath).c_str(), L"wb");
-
-				if (!fp)
-				{
-					dls.isDownloading = false;
-					MessageBox(NULL, va(L"Unable to open %s for writing.", converter.from_bytes(opath).c_str()), L"Error", MB_OK | MB_ICONSTOP);
-
-					return false;
-				}
-
-				download->fp[0] = fp;
+				return false;
 			}
 
 			curl_slist* headers = nullptr;
@@ -486,35 +744,16 @@ bool DL_ProcessDownload()
 					CloseHandle(hFile);
 				}
 
-				std::wstring opathWide = converter.from_bytes(download->opath);
-
 				curl_multi_remove_handle(dls.curl, handle);
 				curl_easy_cleanup(handle);
 				lzma_end(&download->strm);
 
 				if (code == CURLE_OK)
 				{
-					if (DeleteFile(opathWide.c_str()) == 0)
+					if (!onSuccess(it))
 					{
-						if (GetLastError() != ERROR_FILE_NOT_FOUND)
-						{
-							MessageBoxA(NULL, va("Deleting old %s failed (err = %d) - make sure you don't have any existing FiveM processes running", download->url, GetLastError()), "Error", MB_OK | MB_ICONSTOP);
-
-							return false;
-						}
-					}
-
-					if (MoveFile(tmpPathWide.c_str(), opathWide.c_str()) == 0)//rename(tmpPath, opath) != 0)
-					{
-						MessageBoxA(NULL, va("Moving of %s failed (err = %d) - make sure you don't have any existing FiveM processes running", download->url, GetLastError()), "Error", MB_OK | MB_ICONSTOP);
-						DeleteFile(tmpPathWide.c_str());
-
 						return false;
 					}
-
-					dls.completedDownloads++;
-
-					dls.currentDownloads.erase(it);
 				}
 				else
 				{
@@ -676,3 +915,9 @@ bool DL_RunLoop()
 
 	return true;
 }
+
+void StartIPFS()
+{
+	GetIpfsLib();
+}
+#endif

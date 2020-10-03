@@ -93,7 +93,8 @@ class SimpleHandler : public CefClient,
 	public CefDisplayHandler,
 	public CefLifeSpanHandler,
 	public CefLoadHandler,
-	public CefRequestHandler {
+	public CefRequestHandler,
+	public CefResourceRequestHandler{
 public:
 	explicit SimpleHandler();
 	~SimpleHandler();
@@ -113,7 +114,12 @@ public:
 	}
 	virtual CefRefPtr<CefLoadHandler> GetLoadHandler() OVERRIDE { return this; }
 
-	virtual bool OnProcessMessageReceived(CefRefPtr<CefBrowser> browser, CefProcessId source_process, CefRefPtr<CefProcessMessage> message) OVERRIDE;
+	virtual CefRefPtr<CefResourceRequestHandler> GetResourceRequestHandler(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, CefRefPtr<CefRequest> request, bool is_navigation, bool is_download, const CefString& request_initiator, bool& disable_default_handling) OVERRIDE
+	{
+		return this;
+	}
+
+	virtual bool OnProcessMessageReceived(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, CefProcessId source_process, CefRefPtr<CefProcessMessage> message) OVERRIDE;
 
 	// CefDisplayHandler methods:
 	virtual void OnTitleChange(CefRefPtr<CefBrowser> browser,
@@ -164,11 +170,11 @@ void SimpleApp::OnContextInitialized()
 	// Specify CEF browser settings here.
 	CefBrowserSettings browser_settings;
 
-	std::string url = "https://prod.ros.rockstargames.com/scui/mtl/launcher";
+	std::string url = "https://rgl.rockstargames.com/launcher";
 
 	// Create the BrowserView.
 	CefRefPtr<CefBrowserView> browser_view = CefBrowserView::CreateBrowserView(
-		handler, url, browser_settings, NULL, NULL);
+	handler, url, browser_settings, {}, NULL, NULL);
 
 	// Create the Window. It will show itself after creation.
 	CefWindow::CreateTopLevelWindow(new SimpleWindowDelegate(browser_view));
@@ -260,14 +266,6 @@ void SimpleHandler::OnLoadError(CefRefPtr<CefBrowser> browser,
 	// Don't display an error for downloaded files.
 	if (errorCode == ERR_ABORTED)
 		return;
-
-	// Display a load error message.
-	std::stringstream ss;
-	ss << "<html><body bgcolor=\"white\">"
-		"<h2>Failed to load URL "
-		<< std::string(failedUrl) << " with error " << std::string(errorText)
-		<< " (" << errorCode << ").</h2></body></html>";
-	frame->LoadString(ss.str(), failedUrl);
 }
 
 void SimpleHandler::CloseAllBrowsers(bool force_close) {
@@ -295,7 +293,7 @@ auto SimpleHandler::OnBeforeResourceLoad(CefRefPtr<CefBrowser> browser, CefRefPt
 
 extern std::string g_rosData;;
 
-bool SimpleHandler::OnProcessMessageReceived(CefRefPtr<CefBrowser> browser, CefProcessId source_process, CefRefPtr<CefProcessMessage> message)
+bool SimpleHandler::OnProcessMessageReceived(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, CefProcessId source_process, CefRefPtr<CefProcessMessage> message)
 {
 	if (message->GetName() == "invokeNative")
 	{
@@ -320,6 +318,8 @@ bool SimpleHandler::OnProcessMessageReceived(CefRefPtr<CefBrowser> browser, CefP
 		}
 		else if (nativeType == "signin")
 		{
+			trace(__FUNCTION__ ": Processing NUI sign-in.\n");
+
 			auto json = nlohmann::json::parse(messageData.ToString());
 			auto response = json["XMLResponse"];
 
@@ -340,6 +340,8 @@ bool SimpleHandler::OnProcessMessageReceived(CefRefPtr<CefBrowser> browser, CefP
 			});
 
 			g_rosData = obj.dump();
+
+			trace(__FUNCTION__ ": Processed NUI sign-in - closing all browsers.\n");
 
 			CloseAllBrowsers(false);
 		}
@@ -375,7 +377,7 @@ function RGSC_GET_TITLE_ID()
 		RosEnvironment: 'prod',
 		RosTitleVersion: 11,
 		RosPlatform: 'pcros',
-		Platform: 'pc',
+		Platform: 'viveport',
 		IsLauncher: true,
 		Language: 'en-US'
 	});
@@ -478,7 +480,14 @@ function RGSC_READY_TO_ACCEPT_COMMANDS()
 RGSC_JS_READY_TO_ACCEPT_COMMANDS();
 RGSC_JS_REQUEST_UI_STATE(JSON.stringify({ Visible: true, Online: true, State: "SIGNIN" }));
 
-var css = '.rememberContainer, p.Header__signUp { display: none; } .SignInForm__descriptionText span { display: none; } .SignInForm__descriptionText:after { content: \'A Rockstar Games Social Club account owning Grand Theft Auto V is required to play FiveM.\'; max-width: 600px; display: inline-block; }',
+if (!localStorage.getItem('loadedOnce')) {
+	localStorage.setItem('loadedOnce', true);
+	setTimeout(() => {
+		location.reload();
+	}, 500);
+}
+
+var css = '.rememberContainer, p.Header__signUp { display: none; } .SignInForm__descriptionText .Alert__text { display: none; } .Alert__content:after { content: \'A Rockstar Games Social Club account owning Grand Theft Auto V is required to play FiveM.\'; max-width: 600px; display: inline-block; }',
     head = document.head || document.getElementsByTagName('head')[0],
     style = document.createElement('style');
 
@@ -490,9 +499,9 @@ style.appendChild(document.createTextNode(css));
 
 void SimpleHandler::OnLoadEnd(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, int httpStatusCode)
 {
-	if (frame->GetURL().ToString().find("/mtl") != std::string::npos)
+	if (frame->GetURL().ToString().find("/launcher") != std::string::npos)
 	{
-		frame->ExecuteJavaScript(g_rgscInitCode, "https://prod.ros.rockstargames.com/temp.js", 0);
+		frame->ExecuteJavaScript(g_rgscInitCode, "https://rgl.rockstargames.com/temp.js", 0);
 	}
 }
 
@@ -518,7 +527,7 @@ void RunLegitimacyNui()
 
 	std::wstring resPath = MakeRelativeCitPath(L"bin/cef/");
 
-	std::wstring cachePath = MakeRelativeCitPath(L"cache\\browser\\");
+	std::wstring cachePath = MakeRelativeCitPath(L"cache\\authbrowser\\");
 	CreateDirectory(cachePath.c_str(), nullptr);
 
 	CefString(&settings.resources_dir_path).FromWString(resPath);
@@ -530,13 +539,21 @@ void RunLegitimacyNui()
 	// CEF has initialized.
 	CefRefPtr<SimpleApp> app(new SimpleApp);
 
+	trace(__FUNCTION__ ": Initializing CEF.\n");
+
 	// Initialize CEF.
 	CefInitialize(main_args, settings, app.get(), nullptr);
+
+	trace(__FUNCTION__ ": Initialized CEF.\n");
 
 	// Run the CEF message loop. This will block until CefQuitMessageLoop() is
 	// called.
 	CefRunMessageLoop();
 
+	trace(__FUNCTION__ ": Shutting down CEF.\n");
+
 	// Shut down CEF.
-	CefShutdown();
+	//CefShutdown();
+
+	trace(__FUNCTION__ ": Shut down CEF.\n");
 }

@@ -7,6 +7,8 @@
 
 #include "StdInc.h"
 
+#ifdef LAUNCHER_PERSONALITY_MAIN
+#include <CfxLocale.h>
 #include <tinyxml2.h>
 
 #include <stdint.h>
@@ -15,7 +17,9 @@
 #include <unordered_set>
 #include <string>
 
-#include "sha1.h"
+#include <sstream>
+
+#include <openssl/sha.h>
 
 struct cache_t
 {
@@ -154,7 +158,7 @@ bool Updater_RunUpdate(int numCaches, ...)
 {
 	static char cachesFile[800000];
 
-	int result = DL_RequestURL(va(CONTENT_URL "/%s/content/caches.xml", GetUpdateChannel()), cachesFile, sizeof(cachesFile));
+	int result = DL_RequestURL(va(CONTENT_URL "/%s/content/caches.xml?timeStamp=%lld", GetUpdateChannel(), _time64(NULL)), cachesFile, sizeof(cachesFile));
 
 	if (result != 0)
 	{
@@ -234,7 +238,7 @@ bool Updater_RunUpdate(int numCaches, ...)
 
 	for (cache_t& cache : needsUpdate)
 	{
-		result = DL_RequestURL(va(CONTENT_URL "/%s/content/%s/info.xml", GetUpdateChannel(), cache.name.c_str()), cachesFile, sizeof(cachesFile));
+		result = DL_RequestURL(va(CONTENT_URL "/%s/content/%s/info.xml?version=%d&timeStamp=%lld", GetUpdateChannel(), cache.name.c_str(), cache.version, _time64(NULL)), cachesFile, sizeof(cachesFile));
 
 		manifest_t manifest(cache);
 		manifest.Parse(cachesFile);
@@ -261,7 +265,7 @@ bool Updater_RunUpdate(int numCaches, ...)
 		}
 	}
 
-	UI_UpdateText(0, L"Verifying content...");
+	UI_UpdateText(0, gettext(L"Verifying content...").c_str());
 
 	for (auto& filePair : queuedFiles)
 	{
@@ -272,11 +276,17 @@ bool Updater_RunUpdate(int numCaches, ...)
 		std::array<uint8_t, 20> hashEntry;
 		memcpy(hashEntry.data(), file.hash, hashEntry.size());
 
+		std::stringstream formattedHash;
+		for (uint8_t b : hashEntry)
+		{
+			formattedHash << fmt::sprintf("%02X", (uint32_t)b);
+		}
+
 		bool fileOutdated = CheckFileOutdatedWithUI(MakeRelativeCitPath(converter.from_bytes(file.name)).c_str(), { hashEntry }, &fileStart, fileTotal);
 
 		if (fileOutdated)
 		{
-			const char* url = va(CONTENT_URL "/%s/content/%s/%s%s", GetUpdateChannel(), cache.name.c_str(), file.name.c_str(), (file.compressed) ? ".xz" : "");
+			const char* url = va(CONTENT_URL "/%s/content/%s/%s%s?hash=%s", GetUpdateChannel(), cache.name.c_str(), file.name.c_str(), (file.compressed) ? ".xz" : "", formattedHash.str());
 
 			std::string outPath = converter.to_bytes(MakeRelativeCitPath(converter.from_bytes(file.name)));
 
@@ -284,7 +294,7 @@ bool Updater_RunUpdate(int numCaches, ...)
 		}
 	}
 
-	UI_UpdateText(0, L"Updating " PRODUCT_NAME L"...");
+	UI_UpdateText(0, va(gettext(L"Updating %s..."), PRODUCT_NAME));
 
 	bool retval = DL_RunLoop();
 
@@ -347,18 +357,20 @@ bool CheckFileOutdatedWithUI(const wchar_t* fileName, const std::vector<std::arr
 			fileNameOffset = citizenRoot.size();
 		}
 
-		UI_UpdateText(1, va(L"Checking %s", &fileName[fileNameOffset]));
+		UI_UpdateText(1, va(gettext(L"Checking %s"), &fileName[fileNameOffset]));
 
 		LARGE_INTEGER fileSize;
 		GetFileSizeEx(hFile, &fileSize);
 
 		OVERLAPPED overlapped;
 
-		SHA1Context ctx;
-		SHA1Reset(&ctx);
+		SHA_CTX ctx;
+		SHA1_Init(&ctx);
 
 		bool doneReading = false;
 		DWORD fileOffset = 0;
+
+		double lastProgress = 0.0;
 
 		while (!doneReading)
 		{
@@ -410,7 +422,7 @@ bool CheckFileOutdatedWithUI(const wchar_t* fileName, const std::vector<std::arr
 			BOOL olResult = GetOverlappedResult(hFile, &overlapped, &bytesRead, FALSE);
 			DWORD err = GetLastError();
 
-			SHA1Input(&ctx, (uint8_t*)buffer, bytesRead);
+			SHA1_Update(&ctx, (uint8_t*)buffer, bytesRead);
 
 			if (bytesRead < sizeof(buffer) || (!olResult && err == ERROR_HANDLE_EOF))
 			{
@@ -425,14 +437,20 @@ bool CheckFileOutdatedWithUI(const wchar_t* fileName, const std::vector<std::arr
 			}
 			else
 			{
-				UI_UpdateProgress(((*fileStart + fileOffset) / (double)fileTotal) * 100.0);
+				double progress = ((*fileStart + fileOffset) / (double)fileTotal) * 100.0;
+
+				if (abs(progress - lastProgress) > 0.5)
+				{
+					UI_UpdateProgress(progress);
+					lastProgress = progress;
+				}
 			}
 		}
 
 		*fileStart += fileOffset;
 
 		uint8_t outHash[20];
-		SHA1Result(&ctx, outHash);
+		SHA1_Final(outHash, &ctx);
 
 		if (foundHash)
 		{
@@ -479,3 +497,4 @@ const char* GetUpdateChannel()
 
 	return updateChannel.c_str();
 }
+#endif

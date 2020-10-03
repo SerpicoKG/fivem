@@ -12,9 +12,20 @@
 #include "VFSManager.h"
 
 #include <lua.hpp>
+extern "C" {
+#include <lua_rapidjsonlib.h>
+}
 
 class LuaMetaDataLoader : public fx::ResourceMetaDataLoader
 {
+private:
+	enum class LoadFileResult
+	{
+		Success,
+		NoSuchFile,
+		ParseError
+	};
+
 private:
 	lua_State* m_luaState;
 
@@ -23,7 +34,7 @@ private:
 	fx::ResourceMetaDataComponent* m_component;
 
 private:
-	bool LoadFile(const std::string& filename);
+	LoadFileResult LoadFile(const std::string& filename);
 
 	bool DoFile(const std::string& filename, int results);
 
@@ -38,7 +49,7 @@ public:
 	virtual boost::optional<std::string> LoadMetaData(fx::ResourceMetaDataComponent* component, const std::string& resourcePath) override;
 };
 
-bool LuaMetaDataLoader::LoadFile(const std::string& filename)
+auto LuaMetaDataLoader::LoadFile(const std::string& filename) -> LoadFileResult
 {
 	// load the source file
 	fwRefContainer<vfs::Stream> stream = vfs::OpenRead(filename);
@@ -47,7 +58,7 @@ bool LuaMetaDataLoader::LoadFile(const std::string& filename)
 	{
 		m_error = "Could not open resource metadata file " + filename + ".";
 
-		return false;
+		return LoadFileResult::NoSuchFile;
 	}
 
 	auto bytes = stream->ReadToEnd();
@@ -66,10 +77,10 @@ bool LuaMetaDataLoader::LoadFile(const std::string& filename)
 		m_error = "Could not parse resource metadata file " + filename + ": " + luaL_checkstring(m_luaState, -1);
 		lua_pop(m_luaState, 1);
 
-		return false;
+		return LoadFileResult::ParseError;
 	}
 
-	return true;
+	return LoadFileResult::Success;
 }
 
 int LuaMetaDataLoader::PushExceptionHandler()
@@ -89,7 +100,7 @@ bool LuaMetaDataLoader::DoFile(const std::string& filename, int results)
 	bool result = false;
 
 	// load the file
-	if (LoadFile(filename))
+	if (LoadFile(filename) == LoadFileResult::Success)
 	{
 		// call the top function
 		result = true;
@@ -127,6 +138,10 @@ boost::optional<std::string> LuaMetaDataLoader::LoadMetaData(fx::ResourceMetaDat
 	// openlibs as well
 	luaL_openlibs(m_luaState);
 
+	// open lua_rapidjson
+	luaL_requiref(m_luaState, "json", luaopen_rapidjson, 1);
+	lua_pop(m_luaState, 1);  /* remove lib */
+
 	// register a metadata adder for ourselves
 	lua_pushlightuserdata(m_luaState, this);
 
@@ -153,7 +168,7 @@ boost::optional<std::string> LuaMetaDataLoader::LoadMetaData(fx::ResourceMetaDat
 
 	// run global initialization code
 	bool result = true;
-	result = result && DoFile("citizen:/scripting/lua/json.lua", 0);
+	//result = result && DoFile("citizen:/scripting/lua/json.lua", 0);
 
 	result = result && DoFile("citizen:/scripting/resource_init.lua", 1);
 
@@ -176,7 +191,19 @@ boost::optional<std::string> LuaMetaDataLoader::LoadMetaData(fx::ResourceMetaDat
 		for (auto& attempt : fileNameAttempts)
 		{
 			// run the user file
-			attemptResults[i] = attemptResults[i] && LoadFile(fmt::sprintf("%s/%s", resourcePath, attempt));
+			auto result = LoadFile(fmt::sprintf("%s/%s", resourcePath, attempt));
+
+			if (result == LoadFileResult::ParseError)
+			{
+				for (auto& outResult : attemptResults)
+				{
+					outResult = false;
+				}
+
+				break;
+			}
+
+			attemptResults[i] = attemptResults[i] && result == LoadFileResult::Success;
 
 			if (attemptResults[i])
 			{

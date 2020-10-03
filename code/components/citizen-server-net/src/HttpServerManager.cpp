@@ -6,6 +6,8 @@
 #include <HttpServerImpl.h>
 #include <TLSServer.h>
 
+#include <boost/algorithm/string.hpp>
+
 fwEvent<fwRefContainer<net::MultiplexTcpServer>> OnCreateTlsMultiplex;
 
 namespace fx
@@ -25,10 +27,19 @@ namespace fx
 					if (prefix != "/")
 					{
 						matches = _strnicmp(request->GetPath().c_str(), prefix.c_str(), prefix.length()) == 0;
+
+						if (!matches)
+						{
+							if (boost::algorithm::ends_with(prefix, "/"))
+							{
+								eastl::string_view prefixView{ prefix.c_str(), prefix.size() };
+								matches = request->GetPath() == prefixView.substr(0, prefixView.length() - 1);
+							}
+						}
 					}
 					else
 					{
-						matches = request->GetPath() == prefix;
+						matches = request->GetPath().compare(prefix.c_str()) == 0;
 					}
 
 					if (matches)
@@ -42,7 +53,7 @@ namespace fx
 			}
 
 			response->SetStatusCode(404);
-			response->End(fmt::sprintf("Route %s not found.", request->GetPath()));
+			response->End(fmt::sprintf("Route %s not found.", std::string_view{ request->GetPath().c_str() }));
 
 			return true;
 		};

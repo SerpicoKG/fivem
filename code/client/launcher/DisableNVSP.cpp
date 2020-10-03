@@ -1,5 +1,6 @@
 #include "StdInc.h"
 
+#ifdef LAUNCHER_PERSONALITY_MAIN
 #include <cpr/cpr.h>
 #include <rapidjson/document.h>
 
@@ -21,7 +22,15 @@ struct NvidiaConnectionInfo
 
 static std::optional<NvidiaConnectionInfo> GetNvidiaState()
 {
-	std::wstring path = _wgetenv(L"localappdata") + L"\\NVIDIA Corporation\\NvNode\\nodejs.json"s;
+	// we shouldn't even bother with systems that somehow broke core environment variables
+	auto lad = _wgetenv(L"localappdata");
+
+	if (!lad)
+	{
+		return {};
+	}
+
+	std::wstring path = lad + L"\\NVIDIA Corporation\\NvNode\\nodejs.json"s;
 
 	FILE* f = _wfopen(path.c_str(), L"rb");
 
@@ -181,3 +190,4 @@ void NVSP_ShutdownSafely()
 		_wunlink(MakeRelativeCitPath(L"cache\\enable_nvsp").c_str());
 	}
 }
+#endif

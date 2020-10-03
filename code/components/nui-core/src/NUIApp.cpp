@@ -7,6 +7,7 @@
 
 #include "StdInc.h"
 #include "NUIApp.h"
+#include "CefOverlay.h"
 #include "memdbgon.h"
 
 void NUIApp::OnRegisterCustomSchemes(CefRawPtr<CefSchemeRegistrar> registrar)
@@ -36,22 +37,59 @@ bool NUIApp::GetLocalizedString(int messageID, CefString& string)
 void NUIApp::OnContextInitialized()
 {
 	auto manager = CefCookieManager::GetGlobalManager(nullptr);
-	manager->SetSupportedSchemes({ "nui" }, nullptr);
+	manager->SetSupportedSchemes({ "nui" }, true, nullptr);
 }
 
 void NUIApp::OnContextCreated(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, CefRefPtr<CefV8Context> context)
 {
 	CefRefPtr<CefV8Value> window = context->GetGlobal();
 
+#ifdef USE_NUI_ROOTLESS
+	auto et = window->GetValue("EventTarget");
+
+	if (et)
+	{
+		auto prototype = et->GetValue("prototype");
+
+		if (prototype)
+		{
+			auto origEventListener = prototype->GetValue("addEventListener");
+			m_origEventListeners[frame->GetIdentifier()] = origEventListener;
+
+			prototype->SetValue("addEventListener", CefV8Value::CreateFunction("addEventListener", this), V8_PROPERTY_ATTRIBUTE_NONE);
+		}
+	}
+#endif
+
 	window->SetValue("registerPollFunction", CefV8Value::CreateFunction("registerPollFunction", this), V8_PROPERTY_ATTRIBUTE_READONLY);
 	window->SetValue("registerFrameFunction", CefV8Value::CreateFunction("registerFrameFunction", this), V8_PROPERTY_ATTRIBUTE_READONLY);
 	window->SetValue("registerPushFunction", CefV8Value::CreateFunction("registerPushFunction", this), V8_PROPERTY_ATTRIBUTE_READONLY);
+
+#ifdef USE_NUI_ROOTLESS
+	window->SetValue("GetParentResourceName", CefV8Value::CreateFunction("GetParentResourceName", this), V8_PROPERTY_ATTRIBUTE_READONLY);
+#endif
+
 	window->SetValue("invokeNative", CefV8Value::CreateFunction("invokeNative", this), V8_PROPERTY_ATTRIBUTE_READONLY);
 	window->SetValue("nuiSetAudioCategory", CefV8Value::CreateFunction("nuiSetAudioCategory", this), V8_PROPERTY_ATTRIBUTE_READONLY);
+	window->SetValue("nuiTargetGame", CefV8Value::CreateString(
+#ifdef IS_LAUNCHER
+		"launcher"
+#elif defined(IS_RDR3)
+		"rdr3"
+#elif defined(GTA_FIVE)
+		"gta5"
+#else
+		"unknown"
+#endif
+	), V8_PROPERTY_ATTRIBUTE_READONLY);
 }
 
 void NUIApp::OnContextReleased(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, CefRefPtr<CefV8Context> context)
 {
+#ifdef USE_NUI_ROOTLESS
+	m_origEventListeners.erase(frame->GetIdentifier());
+#endif
+
 	for (auto& handler : m_v8ReleaseHandlers)
 	{
 		handler(context);
@@ -65,12 +103,18 @@ void NUIApp::OnBeforeCommandLineProcessing(const CefString& process_type, CefRef
 	command_line->AppendSwitch("use-fake-ui-for-media-stream");
 	command_line->AppendSwitch("enable-speech-input");
 	command_line->AppendSwitch("ignore-gpu-blacklist");
+	command_line->AppendSwitch("ignore-gpu-blocklist"); // future proofing for when Google disables the above
 	command_line->AppendSwitch("enable-usermedia-screen-capture");
 	command_line->AppendSwitch("disable-direct-composition");
+	command_line->AppendSwitch("disable-gpu-driver-bug-workarounds");
 	command_line->AppendSwitchWithValue("default-encoding", "utf-8");
 	//command_line->AppendSwitch("disable-gpu-vsync");
 	command_line->AppendSwitchWithValue("autoplay-policy", "no-user-gesture-required");
 	command_line->AppendSwitch("force-gpu-rasterization");
+	command_line->AppendSwitch("disable-gpu-process-crash-limit");
+
+	// important switch to prevent users from mentioning 'why are there 50 chromes again'
+	command_line->AppendSwitch("disable-site-isolation-trials");
 
 	// some GPUs are in the GPU blacklist as 'forcing D3D9'
 	// this just forces D3D11 anyway.
@@ -84,7 +128,7 @@ void NUIApp::OnBeforeCommandLineProcessing(const CefString& process_type, CefRef
 	command_line->AppendSwitchWithValue("register-pepper-plugins", fmt::sprintf("%s;application/x-cfx-game-view", ToNarrow(MakeRelativeCitPath(L"bin\\d3d_rendering.dll"))));
 }
 
-bool NUIApp::OnProcessMessageReceived(CefRefPtr<CefBrowser> browser, CefProcessId source_process, CefRefPtr<CefProcessMessage> message)
+bool NUIApp::OnProcessMessageReceived(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, CefProcessId source_process, CefRefPtr<CefProcessMessage> message)
 {
 	auto handler = m_processMessageHandlers.find(message->GetName());
 	bool success = false;
@@ -108,6 +152,40 @@ CefRefPtr<CefRenderProcessHandler> NUIApp::GetRenderProcessHandler()
 
 bool NUIApp::Execute(const CefString& name, CefRefPtr<CefV8Value> object, const CefV8ValueList& arguments, CefRefPtr<CefV8Value>& retval, CefString& exception)
 {
+#ifdef USE_NUI_ROOTLESS
+	if (name == "addEventListener")
+	{
+		auto cxt = CefV8Context::GetCurrentContext();
+		auto frame = cxt->GetFrame();
+
+		if (frame)
+		{
+			auto origHandler = m_origEventListeners.find(frame->GetIdentifier());
+
+			if (origHandler != m_origEventListeners.end())
+			{
+				retval = origHandler->second->ExecuteFunction(object, arguments);
+
+				if (arguments.size() > 0 && arguments[0]->IsString() && arguments[0]->GetStringValue() == "message")
+				{
+					auto global = cxt->GetGlobal();
+					auto fn = global->GetValue("nuiInternalCallMessages");
+
+					if (fn)
+					{
+						CefV8ValueList a;
+						fn->ExecuteFunction(global, a);
+					}
+
+					global->SetValue("nuiInternalHandledMessages", CefV8Value::CreateBool(true), V8_PROPERTY_ATTRIBUTE_READONLY);
+				}
+			}
+		}
+
+		return true;
+	}
+#endif
+
 	auto handler = m_v8Handlers.find(name);
 	bool success = false;
 

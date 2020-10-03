@@ -19,6 +19,8 @@
 
 #include <Error.h>
 
+#include <CoreConsole.h>
+
 #include <IteratorView.h>
 #include <ICoreGameInit.h>
 
@@ -80,7 +82,7 @@ static void LoadDefDats(void* dataFileMgr, const char* name, bool enabled)
 	g_dataFileMgr = dataFileMgr;
 
 	// load before-level metas
-	trace("LoadDefDats: %s\n", name);
+	trace("Loading content XML: %s\n", name);
 
 	// load the level
 	dataFileMgr__loadDefDat(dataFileMgr, name, enabled);
@@ -369,7 +371,201 @@ public:
 
 static CfxCacheMounter g_staticCacheMounter;
 
+struct IgnoreCaseLess
+{
+	inline bool operator()(const std::string& left, const std::string& right) const
+	{
+		return _stricmp(left.c_str(), right.c_str()) < 0;
+	}
+};
+
 static CDataFileMountInterface** g_dataFileMounters;
+
+// TODO: this might need to be a ref counter instead?
+static std::set<std::string, IgnoreCaseLess> g_permanentItyps;
+static std::map<uint32_t, std::string> g_itypHashList;
+
+class CfxProxyItypMounter : public CDataFileMountInterface
+{
+private:
+	std::string ParseBaseName(DataFileEntry* entry)
+	{
+		char baseName[256];
+		char* sp = strrchr(entry->name, '/');
+		strcpy_s(baseName, sp ? sp + 1 : entry->name);
+
+		auto dp = strrchr(baseName, '.');
+
+		if (dp)
+		{
+			dp[0] = '\0';
+		}
+
+		return baseName;
+	}
+
+public:
+	virtual bool MountFile(DataFileEntry* entry) override
+	{
+		// parse dir/dir/blah.ityp into blah
+		std::string baseName = ParseBaseName(entry);
+
+		g_itypHashList.insert({ HashString(baseName.c_str()), baseName });
+
+		uint32_t slotId;
+
+		auto module = streaming::Manager::GetInstance()->moduleMgr.GetStreamingModule("ytyp");
+		if (*module->FindSlot(&slotId, baseName.c_str()) != -1)
+		{
+			auto refPool = (atPoolBase*)((char*)module + 56);
+			auto refPtr = refPool->GetAt<char>(slotId);
+
+			if (refPtr)
+			{
+				uint16_t* flags = (uint16_t*)(refPtr + 16);
+
+				if (*flags & 4)
+				{
+					*flags &= ~0x14;
+
+					trace("Removing existing #typ %s\n", baseName);
+
+					g_permanentItyps.insert(baseName);
+
+					streaming::Manager::GetInstance()->ReleaseObject(slotId + module->baseIdx);
+				}
+			}
+		}
+
+		g_dataFileMounters[174]->MountFile(entry);
+
+		return true;
+	}
+
+	virtual bool UnmountFile(DataFileEntry* entry) override
+	{
+		g_dataFileMounters[174]->UnmountFile(entry);
+
+		std::string baseName = ParseBaseName(entry);
+
+		uint32_t slotId;
+
+		auto module = streaming::Manager::GetInstance()->moduleMgr.GetStreamingModule("ytyp");
+		if (*module->FindSlot(&slotId, baseName.c_str()) != -1)
+		{
+			if (g_permanentItyps.find(baseName) != g_permanentItyps.end())
+			{
+				trace("Loading old #typ %s\n", baseName);
+
+				g_permanentItyps.erase(baseName);
+
+				streaming::Manager::GetInstance()->RequestObject(slotId + module->baseIdx, 7);
+
+				auto refPool = (atPoolBase*)((char*)module + 56);
+				auto refPtr = refPool->GetAt<char>(slotId);
+
+				if (refPtr)
+				{
+					*(uint16_t*)(refPtr + 16) |= 4;
+				}
+			}
+		}
+
+		return true;
+	}
+};
+
+static CfxProxyItypMounter g_proxyDlcItypMounter;
+
+struct CInteriorProxy
+{
+	virtual ~CInteriorProxy() = 0;
+
+	uint32_t mapData;
+};
+
+static hook::thiscall_stub<int(void* store, int* out, uint32_t* inHash)> _getIndexByKey([]()
+{
+	return hook::get_pattern("39 1C 91 74 4F 44 8B 4C 91 08 45 3B", -0x34);
+});
+
+#include <atPool.h>
+
+static atPool<CInteriorProxy>** g_interiorProxyPool;
+
+struct ProxyFile
+{
+	uint32_t startAt;
+	uint32_t hash;
+	atArray<uint32_t> proxyHashes;
+};
+
+static atArray<ProxyFile>* g_interiorProxyArray;
+// 1604: 0x142544440;
+
+class CfxProxyInteriorOrderMounter : public CDataFileMountInterface
+{
+public:
+	virtual bool MountFile(DataFileEntry* entry) override
+	{
+		g_dataFileMounters[173]->MountFile(entry);
+
+		return true;
+	}
+
+	virtual bool UnmountFile(DataFileEntry* entry) override
+	{
+		uint32_t entryHash = HashString(entry->name);
+
+		auto mapDataStore = streaming::Manager::GetInstance()->moduleMgr.GetStreamingModule("ymap");
+
+		for (auto& entry : *g_interiorProxyArray)
+		{
+			if (entry.hash == entryHash)
+			{
+				int i = entry.startAt;
+
+				for (auto& proxyHash : entry.proxyHashes)
+				{
+					auto proxy = (*g_interiorProxyPool)->GetAt(i);
+
+					if (proxy)
+					{
+						bool can = true;
+
+						if (proxy->mapData)
+						{
+							auto pool = (atPoolBase*)((char*)mapDataStore + 56);
+							auto entry = pool->GetAt<char>(proxy->mapData);
+
+							if (entry && (*(uint32_t*)(entry + 32) & 0xC00) == 0x800)
+							{
+								can = false;
+							}
+						}
+
+						if (can || streaming::IsStreamerShuttingDown())
+						{
+							// goodbye, interior proxy
+							trace("deleted interior proxy %08x\n", proxyHash);
+							delete proxy;
+						}
+					}
+					else
+					{
+						trace(":( didn't find interior proxy %08x\n", proxyHash);
+					}
+
+					i++;
+				}
+			}
+		}
+		
+		return true;
+	}
+};
+
+static CfxProxyInteriorOrderMounter g_proxyInteriorOrderMounter;
 
 static CDataFileMountInterface* LookupDataFileMounter(const std::string& type)
 {
@@ -399,6 +595,16 @@ static CDataFileMountInterface* LookupDataFileMounter(const std::string& type)
 	if (fileType == 160) // TEXTFILE_METAFILE 
 	{
 		return nullptr;
+	}
+
+	if (fileType == 173) // INTERIOR_PROXY_ORDER_FILE
+	{
+		return &g_proxyInteriorOrderMounter;
+	}
+
+	if (fileType == 174) // DLC_ITYP_REQUEST
+	{
+		return &g_proxyDlcItypMounter;
 	}
 
 	return g_dataFileMounters[fileType];
@@ -457,6 +663,24 @@ inline void HandleDataFileList(const TList& list, const TFn& fn, const char* op 
 	}
 }
 
+template<typename TFn, typename TList>
+inline void HandleDataFileListWithTypes(TList& list, const TFn& fn, const std::set<int>& types, const char* op = "loading")
+{
+	for (auto it = list.begin(); it != list.end(); )
+	{
+		if (types.find(LookupDataFileType(it->first)) != types.end())
+		{
+			HandleDataFile(*it, fn, op);
+
+			it = list.erase(it);
+		}
+		else
+		{
+			++it;
+		}
+	}
+}
+
 void LoadStreamingFiles(bool earlyLoad = false);
 
 static LONG FilterUnmountOperation(DataFileEntry& entry)
@@ -504,6 +728,8 @@ namespace streaming
 	{
 		auto dataFilePair = std::make_pair(type, path);
 
+		std::remove(g_dataFiles.begin(), g_dataFiles.end(), dataFilePair);
+
 		if (std::find(g_loadedDataFiles.begin(), g_loadedDataFiles.end(), dataFilePair) == g_loadedDataFiles.end())
 		{
 			return;
@@ -538,11 +764,12 @@ static hook::cdecl_stub<rage::fiCollection*()> getRawStreamer([]()
 #include <unordered_set>
 
 static std::set<std::tuple<std::string, std::string>> g_customStreamingFiles;
-static std::set<std::string> g_customStreamingFileRefs;
+std::set<std::string> g_customStreamingFileRefs;
 static std::map<std::string, std::vector<std::string>, std::less<>> g_customStreamingFilesByTag;
 static std::unordered_map<int, std::list<uint32_t>> g_handleStack;
 static std::set<std::pair<streaming::strStreamingModule*, int>> g_pendingRemovals;
 std::unordered_map<int, std::string> g_handlesToTag;
+static std::set<std::string> g_pedsToRegister;
 
 static std::unordered_set<int> g_ourIndexes;
 
@@ -563,6 +790,14 @@ static std::string GetBaseName(const std::string& name)
 	}
 
 	return retval;
+}
+
+namespace rage
+{
+	static hook::cdecl_stub<void(uint16_t)> pgRawStreamerInvalidateEntry([]()
+	{
+		return hook::get_pattern("44 0F B7 C3 41 8B C0 41 81 E0 FF 03 00 00 C1", -0x51);
+	});
 }
 
 static void LoadStreamingFiles(bool earlyLoad)
@@ -621,8 +856,13 @@ static void LoadStreamingFiles(bool earlyLoad)
 		{
 			// try to create/get an asset in the streaming module
 			// RegisterStreamingFile will still work if one exists as long as the handle remains 0
-			uint32_t strId;
-			strModule->FindSlotFromHashKey(&strId, nameWithoutExt.c_str());
+			uint32_t strId = -1;
+			strModule->FindSlot(&strId, nameWithoutExt.c_str());
+
+			if (strId == -1)
+			{
+				strModule->FindSlotFromHashKey(&strId, nameWithoutExt.c_str());
+			}
 
 			g_ourIndexes.insert(strId + strModule->baseIdx);
 			g_pendingRemovals.erase({ strModule, strId });
@@ -638,7 +878,7 @@ static void LoadStreamingFiles(bool earlyLoad)
 				{
 					auto& entry = cstreaming->Entries[strId + strModule->baseIdx];
 
-					trace("overriding handle for %s (was %x) -> %x\n", baseName, entry.handle, (rawStreamer->GetCollectionId() << 16) | idx);
+					console::DPrintf("gta:streaming:five", "overriding handle for %s (was %x) -> %x\n", baseName, entry.handle, (rawStreamer->GetCollectionId() << 16) | idx);
 
 					// if no old handle was saved, save the old handle
 					auto& hs = g_handleStack[strId + strModule->baseIdx];
@@ -665,6 +905,8 @@ static void LoadStreamingFiles(bool earlyLoad)
 					auto& entry = cstreaming->Entries[fileId];
 					g_handleStack[fileId].push_front(entry.handle);
 
+					rage::pgRawStreamerInvalidateEntry(entry.handle & 0xFFFF);
+
 					g_handlesToTag[entry.handle] = tag;
 				}
 				else
@@ -673,9 +915,15 @@ static void LoadStreamingFiles(bool earlyLoad)
 				}
 			}
 		}
-		else
+		else if (ext != "ymf")
 		{
 			trace("can't register %s: no streaming module (does this file even belong in stream?)\n", file);
+		}
+
+		// register ped asset
+		if (baseName.find('/') != std::string::npos)
+		{
+			g_pedsToRegister.insert(baseName.substr(0, baseName.find('/')));
 		}
 	}
 }
@@ -884,14 +1132,113 @@ void LoadManifest(const char* tagName)
 
 		rage::fiDevice::Unmount("localPack:/");
 
+		struct CItypDependencies 
+		{
+			uint32_t itypName;
+			uint32_t manifestFlags;
+
+			atArray<uint32_t> itypDepArray;
+		};
+
+		struct manifestData
+		{
+			char pad[48];
+			atArray<CItypDependencies> itypDependencies;
+		}* manifestChunk = (manifestData*)manifestChunkPtr;
+
+		for (auto& dep : manifestChunk->itypDependencies)
+		{
+			if (auto it = g_itypHashList.find(dep.itypName); it != g_itypHashList.end())
+			{
+				auto name = fmt::sprintf("dummy/%s.ityp", it->second);
+				trace("Fixing manifest-required #typ dependency for %s\n", name);
+
+				auto mounter = LookupDataFileMounter("DLC_ITYP_REQUEST");
+
+				DataFileEntry entry = { 0 };
+				strcpy_s(entry.name, name.c_str());
+
+				mounter->UnmountFile(&entry);
+			}
+		}
+
 		_loadManifestChunk(manifestChunkPtr);
 		_clearManifestChunk(manifestChunkPtr);
+	}
+}
+
+#include <EntitySystem.h>
+#include <RageParser.h>
+
+struct CPedModelInfo
+{
+private:
+	uint64_t vtbl;
+	uint8_t pad[16];
+public:
+	uint32_t hash;
+
+private:
+	uint8_t pad2[428];
+
+public:
+	atArray<char> streamFolder;
+
+private:
+	uint8_t pad3[188];
+};
+
+static hook::cdecl_stub<void(fwFactoryBase<fwArchetype>*, atArray<CPedModelInfo*>&)> _getAllPedArchetypes([]()
+{
+	return hook::get_call(hook::get_pattern("44 8B E0 4C 89 6C 24 20 44 89 6C 24 28 E8", 13));
+});
+
+static void RegisterPeds()
+{
+	auto pedArchetypeFactory = (*g_archetypeFactories)[6];
+
+	atArray<CPedModelInfo*> mis;
+	_getAllPedArchetypes(pedArchetypeFactory, mis);
+
+	for (auto mi : mis)
+	{
+		for (const auto& ped : g_pedsToRegister)
+		{
+			if (mi->hash == HashString(ped.c_str()))
+			{
+				mi->streamFolder.Expand(ped.size() + 1);
+				
+				strcpy(&mi->streamFolder[0], ped.c_str());
+				mi->streamFolder.m_count = ped.size() + 1;
+			}
+		}
 	}
 }
 
 static void LoadDataFiles()
 {
 	trace("Loading mounted data files (total: %d)\n", g_dataFiles.size());
+
+	// sort data file array by type, a little
+	auto dfSort = [](const std::pair<std::string, std::string>& type)
+	{
+		auto h = HashString(type.first.c_str());
+
+		if (h == HashString("VEHICLE_LAYOUTS_FILE") || h == HashString("HANDLING_FILE"))
+		{
+			return 0;
+		}
+		else
+		{
+			return 100;
+		}
+	};
+
+	// we use stable_sort as equivalent entries need to retain equivalent order
+	std::stable_sort(g_dataFiles.begin(), g_dataFiles.end(), [dfSort](const auto& left, const auto& right)
+	{
+		return dfSort(left) < dfSort(right);
+	});
 
 	HandleDataFileList(g_dataFiles, [] (CDataFileMountInterface* mounter, DataFileEntry& entry)
 	{
@@ -906,6 +1253,13 @@ static void LoadDataFiles()
 		trace("Performing deferred RELOAD_MAP_STORE.\n");
 
 		ReloadMapStore();
+	}
+
+	if (!g_pedsToRegister.empty())
+	{
+		RegisterPeds();
+
+		g_pedsToRegister.clear();
 	}
 }
 
@@ -991,7 +1345,7 @@ void DLL_EXPORT CfxCollection_RemoveStreamingTag(const std::string& tag)
 		if (strModule)
 		{
 			uint32_t strId;
-			strModule->FindSlotFromHashKey(&strId, nameWithoutExt.c_str());
+			strModule->FindSlot(&strId, nameWithoutExt.c_str());
 
 			auto rawStreamer = getRawStreamer();
 			uint32_t idx = (rawStreamer->GetCollectionId() << 16) | rawStreamer->GetEntryByName(file.c_str());
@@ -1058,6 +1412,14 @@ static void UnloadDataFiles()
 
 		g_loadedDataFiles.clear();
 	}
+}
+
+static void UnloadDataFilesOfTypes(const std::set<int>& types)
+{
+	HandleDataFileListWithTypes(g_loadedDataFiles, [](CDataFileMountInterface* mounter, DataFileEntry& entry)
+	{
+		return mounter->UnmountFile(&entry);
+	}, types, "pre-unloading");
 }
 
 static hook::cdecl_stub<void()> _unloadMultiplayerContent([]()
@@ -1251,8 +1613,7 @@ static void(*g_origUnloadWeaponInfos)();
 
 static hook::cdecl_stub<void(void*)> wib_ctor([]()
 {
-	// 1604
-	return (void*)0x140E78710;
+	return hook::get_pattern("41 8D 50 01 48 8D 41", -0x35);
 });
 
 struct CWeaponInfoBlob
@@ -1349,8 +1710,63 @@ static bool fwMapDataStore__ModifyHierarchyStatusRecursive(streaming::strStreami
 
 static bool g_lockReload;
 
+static void (*g_origLoadReplayDlc)(void* ecw);
+
+static void LoadReplayDlc(void* ecw)
+{
+	g_lockReload = false;
+
+	LoadStreamingFiles(true);
+
+	g_origLoadReplayDlc(ecw);
+
+	LoadStreamingFiles();
+	LoadDataFiles();
+}
+
+static void (*g_origfwMapTypes__ConstructArchetypes)(void* mapTypes, int32_t idx);
+
+static void fwMapTypes__ConstructArchetypesStub(void* mapTypes, int32_t idx)
+{
+	// free this archetype file since we're recreating it anyway
+	// this should be safe, as an asset won't get loaded without it having been unloaded before
+	rage__fwArchetypeManager__FreeArchetypes(idx);
+
+	g_origfwMapTypes__ConstructArchetypes(mapTypes, idx);
+}
+
+static void (*g_origfwMapDataStore__FinishLoading)(void* store, int32_t idx, CMapData** data);
+
+static void fwMapDataStore__FinishLoadingHook(streaming::strStreamingModule* store, int32_t idx, CMapData** data)
+{
+	CMapData* mapData = *data;
+
+	static_assert(offsetof(CMapData, name) == 8, "CMapData::name");
+
+	for (fwEntityDef* entity : mapData->entities)
+	{
+		if (entity->GetTypeIdentifier()->m_nameHash == HashRageString("CMloInstanceDef"))
+		{
+			if (!(mapData->contentFlags & 8))
+			{
+				trace("Fixed fwMapData contentFlags (missing 'interior' flag) in %s.\n", streaming::GetStreamingNameForIndex(idx + store->baseIdx));
+				mapData->contentFlags |= 8;
+			}
+		}
+	}
+
+	return g_origfwMapDataStore__FinishLoading(store, idx, data);
+}
+
 static HookFunction hookFunction([] ()
 {
+	{
+		auto location = hook::pattern("BA A1 85 94 52 41 B8 01").count(1).get(0).get<char>(0x34);
+		g_interiorProxyPool = (decltype(g_interiorProxyPool))(location + *(int32_t*)location + 4);
+	}
+
+	g_interiorProxyArray = hook::get_address<decltype(g_interiorProxyArray)>(hook::get_pattern("83 FA FF 75 4D 48 8D 0D ? ? ? ? BA", 8));
+
 	// process streamer-loaded resource: check 'free instantly' flag even if no dependencies exist (change jump target)
 	*hook::get_pattern<int8_t>("4C 63 C0 85 C0 7E 54 48 8B", 6) = 0x25;
 
@@ -1451,6 +1867,8 @@ static HookFunction hookFunction([] ()
 			// unload GROUP_MAP and load GROUP_MAP_SP
 			_unloadMultiplayerContent();
 		}
+
+		g_pedsToRegister.clear();
 	}, 99925);
 
 	OnKillNetworkDone.Connect([]()
@@ -1459,6 +1877,9 @@ static HookFunction hookFunction([] ()
 		SafelyDrainStreamer();
 
 		g_unloadingCfx = false;
+
+		// unload pre-unloaded data files
+		UnloadDataFilesOfTypes({ 0xB3 /* popgroups override */, 166 /* DLC_WEAPON_PICKUPS */ });
 	}, 99900);
 
 	Instance<ICoreGameInit>::Get()->OnShutdownSession.Connect([]()
@@ -1484,6 +1905,7 @@ static HookFunction hookFunction([] ()
 		}
 
 		auto typesStore = streaming::Manager::GetInstance()->moduleMgr.GetStreamingModule("ytyp");
+		auto navMeshStore = streaming::Manager::GetInstance()->moduleMgr.GetStreamingModule("ynv");
 
 		for (auto [ module, idx ] : g_pendingRemovals)
 		{
@@ -1504,7 +1926,11 @@ static HookFunction hookFunction([] ()
 				rage__fwArchetypeManager__FreeArchetypes(idx);
 			}
 
-			module->RemoveSlot(idx);
+			// navmeshstore won't remove from some internal 'name hash' and therefore re-registration crashes
+			if (module != navMeshStore)
+			{
+				module->RemoveSlot(idx);
+			}
 		}
 
 		g_pendingRemovals.clear();
@@ -1559,6 +1985,13 @@ static HookFunction hookFunction([] ()
 		}
 	});
 
+	// replay dlc loading
+	{
+		auto location = hook::get_pattern("0F 84 ? ? ? ? 48 8B 0D ? ? ? ? C6 05 ? ? ? ? 01 E8", 20);
+		hook::set_call(&g_origLoadReplayDlc, location);
+		hook::call(location, LoadReplayDlc);
+	}
+
 	// special point for CWeaponMgr streaming unload
 	// (game calls CExtraContentManager::ExecuteTitleUpdateDataPatchGroup with a specific group intended for weapon info here)
 	{
@@ -1587,6 +2020,20 @@ static HookFunction hookFunction([] ()
 	{
 		MH_Initialize();
 		MH_CreateHook(hook::get_pattern("4C 63 C2 33 ED 46 0F B6 0C 00 8B 41 4C", -18), fwMapTypesStore__Unload, (void**)&g_origUnloadMapTypes);
+		MH_EnableHook(MH_ALL_HOOKS);
+	}
+
+	// fwMapDataStore::FinishLoading map flag fixing
+	{
+		MH_Initialize();
+		MH_CreateHook(hook::get_pattern("25 00 0C 00 00 3D 00 08 00 00 49 8B 06", -0x6F), fwMapDataStore__FinishLoadingHook, (void**)&g_origfwMapDataStore__FinishLoading);
+		MH_EnableHook(MH_ALL_HOOKS);
+	}
+
+	// fwMapTypes::ConstructArchetypes hook (for #typ override issues with different sizes)
+	{
+		MH_Initialize();
+		MH_CreateHook(hook::get_pattern("FF 50 28 0F B7 46 20 33 ED", -0x21), fwMapTypes__ConstructArchetypesStub, (void**)&g_origfwMapTypes__ConstructArchetypes);
 		MH_EnableHook(MH_ALL_HOOKS);
 	}
 

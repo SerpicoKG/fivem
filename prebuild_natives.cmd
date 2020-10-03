@@ -4,35 +4,39 @@ setlocal EnableDelayedExpansion
 
 set path=C:\msys64\usr\bin;%path%
 
-pacman --noconfirm --needed -S make curl diffutils
+pacman --noconfirm --needed -Sy make curl diffutils libcurl
+
+pushd ext\native-doc-gen\
+sh build.sh
+popd
 
 pushd ext\natives\
-mkdir out
-curl -z out\natives_global.lua -Lo out\natives_global_new.lua http://runtime.fivem.net/doc/natives.lua
-curl -z out\natives_cfx.lua -Lo out\natives_cfx_new.lua http://runtime.fivem.net/doc/natives_cfx.lua
+mkdir inp
+curl -z inp\natives_global.lua -Lo inp\natives_global_new.lua http://runtime.fivem.net/doc/natives.lua
+curl -z inp\natives_rdr3.lua -Lo inp\natives_rdr3_new.lua http://runtime.fivem.net/doc/natives_rdr_tmp.lua
 
-if exist out\natives_cfx.lua (
-	diff out\natives_cfx.lua out\natives_cfx_new.lua > nul
+if exist inp\natives_global.lua (
+	diff inp\natives_global.lua inp\natives_global_new.lua > nul
 	
 	if errorlevel 0 (
-		copy /y out\natives_cfx_new.lua out\natives_cfx.lua
+		copy /y inp\natives_global_new.lua inp\natives_global.lua
 	)
 ) else (
-	copy /y out\natives_cfx_new.lua out\natives_cfx.lua
+	copy /y inp\natives_global_new.lua inp\natives_global.lua
 )
 
-if exist out\natives_global.lua (
-	diff out\natives_global.lua out\natives_global_new.lua > nul
+if exist inp\natives_rdr3.lua (
+	diff inp\natives_rdr3.lua inp\natives_rdr3_new.lua > nul
 	
 	if errorlevel 0 (
-		copy /y out\natives_global_new.lua out\natives_global.lua
+		copy /y inp\natives_rdr3_new.lua inp\natives_rdr3.lua
 	)
 ) else (
-	copy /y out\natives_global_new.lua out\natives_global.lua
+	copy /y inp\natives_rdr3_new.lua inp\natives_rdr3.lua
 )
 
-del out\natives_global_new.lua
-del out\natives_cfx_new.lua
+del inp\natives_global_new.lua
+del inp\natives_rdr3_new.lua
 
 make -q
 

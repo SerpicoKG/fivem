@@ -84,6 +84,14 @@ end
 
 vendor_component = function(name)
 	local vendorTable = dofile(name .. '.lua')
+	
+	for k, repo in all_private_repos() do
+		local repoRel = path.getrelative(path.getabsolute(''), repo) .. '/vendor/' .. name .. '.lua'
+		
+		if os.isfile(repoRel) then
+			vendorTable = loadfile(repoRel)(vendorTable)
+		end
+	end
 
 	if vendorTable then
 		component {
@@ -274,7 +282,7 @@ local do_component = function(name, comp)
 	links { "Shared", "fmtlib" }
 
 	-- HACKHACK: premake doesn't allow unsetting these
-	if name ~= 'adhesive' then
+	if name ~= 'adhesive' and name ~= 'legacy-game-re3' and name ~= 'fxdk-main' then
 		pchsource "client/common/StdInc.cpp"
 		pchheader "StdInc.h"
 	end
@@ -299,8 +307,25 @@ local do_component = function(name, comp)
 		end
 	end
 
+	_G._ROOTPATH = path.getabsolute('.')
+
 	configuration {}
 	local postCb = dofile(comp.absPath .. '/component.lua')
+	local postCbs = {}
+	
+	table.insert(postCbs, postCb)
+	
+	configuration {}
+	if not comp.private then
+		for k, repo in all_private_repos() do
+			local repoRel = path.getrelative(path.getabsolute(''), repo) .. '/components/' .. name .. '/component_override.lua'
+			
+			if os.isfile(repoRel) then
+				postCb = dofile(repoRel)
+				table.insert(postCbs, postCb)
+			end
+		end
+	end
 
 	-- loop again in case a previous file has set a configuration constraint
 	for k, v in ipairs(deps) do
@@ -344,8 +369,10 @@ local do_component = function(name, comp)
 	filter()
 		vpaths { ["z/*"] = relPath .. "/component.rc" }
 		
-	if postCb then
-		postCb()
+	for _, v in ipairs(postCbs) do
+		if v then
+			v()
+		end
 	end
 
 	if not _OPTIONS['tests'] then

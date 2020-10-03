@@ -6,6 +6,12 @@
 #include <ICoreGameInit.h>
 
 #include <MinHook.h>
+#include <Hooking.Aux.h>
+
+#include <CoreConsole.h>
+#include <Error.h>
+
+#include <CrossBuildRuntime.h>
 
 HRESULT(*g_origInitializeGraphics)(void*, void*, void*);
 
@@ -18,6 +24,8 @@ LONG_PTR DontSetWindowLongPtrW(HWND hWnd, int nIndex, LONG_PTR dwNewLong)
 
 HRESULT NullInitializeGraphics(void* rgscUI, void* d3dDevice, void* hWndStruct)
 {
+	DisableToolHelpScope ts;
+
 	trace("NullInitializeGraphics\n");
 
 	auto fn = GetProcAddress(GetModuleHandle(L"user32.dll"), "SetWindowLongPtrW");
@@ -41,7 +49,7 @@ HRESULT NullCopyBuffer(void* rgscUI, void* a1)
 	return S_OK;
 }
 
-#define LOG_CALL() trace("%s\n", __FUNCTION__)
+#define LOG_CALL() console::DPrintf("ros-patches", "%s\n", __FUNCTION__)
 
 class IRgscUi
 {
@@ -220,8 +228,12 @@ public:
 	{
 		//return true;
 		bool ov = m_baseRgsc->isX();
-		//return ov;
+
+#if defined(IS_RDR3)
+		return ov;
+#else
 		return g_signedIn;
+#endif
 	}
 
 	virtual bool isOnline() override
@@ -299,7 +311,12 @@ static std::wstring GetCitizenSavePath()
 
 		// append our path components
 		AppendPathComponent(savePath, L"\\CitizenFX");
+
+#if !defined(IS_RDR3)
 		AppendPathComponent(savePath, L"\\GTA5");
+#else
+		AppendPathComponent(savePath, L"\\RDR2");
+#endif
 
 		// append a final separator
 		savePath += L"\\";
@@ -490,6 +507,9 @@ public:
 	virtual void* OnEvent(RgscEvent event, const void* data) = 0;
 };
 
+std::string GetRockstarTicketXml();
+IRgscDelegate* g_delegate;
+
 struct FriendStatus
 {
 	uint32_t status;
@@ -553,6 +573,33 @@ class RgscLogDelegate : public IRgscDelegate
 	{
 		LOG_CALL();
 
+		if (event == RgscEvent::SdkInitError)
+		{
+			auto errorCode = *(int*)data;
+			std::string errorHelp;
+
+			switch (errorCode)
+			{
+			case 1014:
+				errorHelp = "Failed to initialize renderer subprocess.\n";
+				break;
+			case 1024:
+				errorHelp = "Failed to validate DLL versions.\n";
+				break;
+			case 1002:
+				errorHelp = "Failed to initialize file system.\n";
+				break;
+			case 1008:
+				errorHelp = "Failed to initialize gamer pic manager.\n";
+				break;
+			case 1005:
+				errorHelp = "Failed to initialize metadata. Please verify your game files before trying anything else.\n";
+				break;
+			}
+
+			FatalError("R* SC SDK failed to initialize. Error code: %d\n%s\nPlease click 'Save information' below and upload the saved .zip file when asking for help!", errorCode, errorHelp);
+		}
+
 		if (event == RgscEvent::FriendStatusChanged)
 		{
 			auto fdata = (FriendStatus*)data;
@@ -560,6 +607,29 @@ class RgscLogDelegate : public IRgscDelegate
 		else if (event == (RgscEvent)0xD)
 		{
 			SetEvent(g_uiEvent);
+
+			/*if (!g_signedIn)
+			{
+				int zero = 0;
+				g_delegate->OnEvent((RgscEvent)0xD, &zero);
+
+				FriendStatus fs = { 0 };
+				fs.status = 5;
+				fs.unk0x1 = 1;
+				fs.unk0x1000 = 0x1000;
+				fs.unk0x7FFA = 0x7FFA;
+				fs.jsonDataLength = 0x1D0;
+				fs.jsonDataString = R"({"SignedIn":true,"SignedOnline":true,"ScAuthToken":"AAAAArgQdyps/xBHKUumlIADBO75R0gAekcl3m2pCg3poDsXy9n7Vv4DmyEmHDEtv49b5BaUWBiRR/lVOYrhQpaf3FJCp4+22ETI8H0NhuTTijxjbkvDEViW9x6bOEAWApixmQue2CNN3r7X8vQ/wcXteChEHUHi","ScAuthTokenError":false,"ProfileSaved":true,"AchievementsSynced":false,"FriendsSynced":false,"Local":false,"NumFriendsOnline":0,"NumFriendsPlayingSameTitle":0,"NumBlocked":0,"NumFriends":0,"NumInvitesReceieved":0,"NumInvitesSent":0,"CallbackData":2})";
+
+				g_delegate->OnEvent(RgscEvent::FriendStatusChanged, &fs);
+
+				g_delegate->OnEvent(RgscEvent::RosTicketChanged, GetRockstarTicketXml().c_str());
+
+				//int yes = 1;
+				//delegate->OnEvent(RgscEvent::SigninStateChanged, &yes);
+
+				g_signedIn = true;
+			}*/
 		}
 
 		return nullptr;
@@ -592,8 +662,6 @@ public:
 	virtual void* m_16() = 0;
 	virtual void* m_17() = 0;
 };
-
-std::string GetRockstarTicketXml();
 
 class RgscStub : public IRgsc
 {
@@ -644,7 +712,10 @@ public:
 
 		static uint32_t lastAllowedScUpdate;
 
+#if defined(IS_RDR3)
+#else
 		if ((GetTickCount() - lastAllowedScUpdate > 250) || !Instance<ICoreGameInit>::Get()->GetGameLoaded())
+#endif
 		{
 			lastAllowedScUpdate = GetTickCount();
 
@@ -707,6 +778,8 @@ public:
 		LOG_CALL();
 
 		g_uiEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+
+		g_delegate = delegate;
 
 		std::thread([delegate]()
 		{
@@ -847,7 +920,15 @@ IRgsc* GetScSdkStub()
 	
 	if (!g_rgsc)
 	{
-		g_rgsc = new RgscStub(getFunc());
+		if (getenv("CitizenFX_ToolMode") || Is372())
+		{
+			g_rgsc = (RgscStub*)getFunc();
+		}
+		else
+		{
+			//g_rgsc = (RgscStub*)getFunc();
+			g_rgsc = new RgscStub(getFunc());
+		}
 	}
 
 	return g_rgsc;

@@ -123,9 +123,22 @@ namespace rage
 
 		netSyncNodeBase* firstChild;
 	};
+
+	class netSyncDataNodeBase : public netSyncNodeBase
+	{
+	public:
+		uint32_t flags;
+		uint32_t pad3;
+		uint64_t pad4;
+		netSyncDataNodeBase* parentData; //0x50
+		uint32_t childCount;
+		netSyncDataNodeBase* children[8];
+		uint8_t syncFrequencies[8];
+		void* nodeBuffer;
+	};
 }
 
-static rage::netObject* g_curNetObjectSelection;
+rage::netObject* g_curNetObjectSelection;
 static rage::netSyncNodeBase* g_curSyncNodeSelection;
 
 static void RenderSyncNode(rage::netObject* object, rage::netSyncNodeBase* node)
@@ -308,6 +321,8 @@ static TSyncLog TraverseSyncTree(TSyncLog* old, int oldId, rage::netSyncTree* sy
 
 #include <array>
 
+void DirtyNode(void* object, void* node);
+
 namespace rage
 {
 struct WriteTreeState
@@ -415,7 +430,18 @@ bool netSyncTree::WriteTreeCfx(int flags, int objFlags, rage::netObject* object,
 	}
 
 	// #NETVER: 2018-12-27 17:41 -> increased maximum packet size to 768 from 256 to account for large CPlayerAppearanceDataNode
-	int sizeLength = (Instance<ICoreGameInit>::Get()->NetProtoVersion >= 0x201812271741) ? 13 : 11;
+	static auto icgi = Instance<ICoreGameInit>::Get();
+
+	int sizeLength = 13;
+	
+	if (icgi->OneSyncBigIdEnabled)
+	{
+		sizeLength = 16;
+	}
+	else if (icgi->NetProtoVersion < 0x201812271741)
+	{
+		sizeLength = 11;
+	}
 
 	TraverseTree<WriteTreeState>(this, state, [sizeLength](WriteTreeState& state, rage::netSyncNodeBase* node, const std::function<bool()>& cb)
 	{
@@ -515,6 +541,18 @@ bool netSyncTree::WriteTreeCfx(int flags, int objFlags, rage::netObject* object,
 			else
 			{
 				state.wroteAny = true;
+
+				if (node->IsDataNode())
+				{
+					auto dataNode = (rage::netSyncDataNodeBase*)node;
+
+					static_assert(offsetof(rage::netSyncDataNodeBase, parentData) == 0x50, "parentData off");
+
+					for (int child = 0; child < dataNode->childCount; child++)
+					{
+						DirtyNode(state.object, dataNode->children[child]);
+					}
+				}
 
 				if (state.object)
 				{
@@ -728,7 +766,9 @@ static InitFunction initFunction([]()
 
 			if (ImGui::Begin("Time", &timeOpen))
 			{
-				ImGui::Text("%u", rage::netInterface_queryFunctions::GetInstance()->GetTimestamp());
+				auto inst = rage::netInterface_queryFunctions::GetInstance();
+
+				ImGui::Text("%u", inst ? inst->GetTimestamp() : 0);
 			}
 
 			ImGui::End();
@@ -769,7 +809,7 @@ static InitFunction initFunction([]()
 					RenderNetObjectDetail(g_curNetObjectSelection);
 				}
 
-				if (g_curSyncNodeSelection)
+				if (g_curNetObjectSelection && g_curSyncNodeSelection)
 				{
 					ImGui::Separator();
 

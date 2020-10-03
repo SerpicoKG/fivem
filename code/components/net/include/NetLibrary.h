@@ -10,6 +10,7 @@
 #include <bitset>
 #include <functional>
 #include <thread>
+#include <ppltasks.h>
 #include <WS2tcpip.h>
 #include "HttpClient.h"
 #include "CrossLibraryInterfaces.h"
@@ -27,7 +28,7 @@
 
 #include <concurrent_queue.h>
 
-#define NETWORK_PROTOCOL 5
+#define NETWORK_PROTOCOL 9
 
 enum NetAddressType
 {
@@ -74,38 +75,6 @@ public:
 #include "NetBuffer.h"
 
 class NetLibrary;
-
-#define FRAGMENT_SIZE (uint32_t)1300
-
-class NetChannel
-{
-private:
-	int m_fragmentSequence;
-	int m_fragmentLength;
-	char* m_fragmentBuffer;
-	std::bitset<65536 / FRAGMENT_SIZE> m_fragmentValidSet;
-	int m_fragmentLastBit;
-
-	uint32_t m_inSequence;
-	uint32_t m_outSequence;
-
-	NetAddress m_targetAddress;
-	NetLibraryImplBase* m_netLibrary;
-
-private:
-	void SendFragmented(NetBuffer& buffer);
-
-public:
-	NetChannel();
-
-	void Reset(NetAddress& target, NetLibraryImplBase* netLibrary);
-
-	void Send(NetBuffer& buffer);
-
-	bool Process(const char* message, size_t size, NetBuffer** buffer);
-};
-
-#define MAX_RELIABLE_COMMANDS 64
 
 struct NetLibraryClientInfo
 {
@@ -228,7 +197,7 @@ public:
 
 	virtual void RunFrame() override;
 
-	virtual void ConnectToServer(const std::string& rootUrl);
+	virtual concurrency::task<void> ConnectToServer(const std::string& rootUrl);
 
 	virtual void Disconnect(const char* reason) override;
 

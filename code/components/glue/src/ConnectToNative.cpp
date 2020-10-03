@@ -6,10 +6,13 @@
  */
 
 #include "StdInc.h"
+
+#include <CfxLocale.h>
 #include <CefOverlay.h>
 #include <NetLibrary.h>
 #include <strsafe.h>
 #include <GlobalEvents.h>
+
 #include <nutsnbolts.h>
 #include <ConsoleHost.h>
 #include <CoreConsole.h>
@@ -38,9 +41,15 @@
 
 #include <LauncherIPC.h>
 
+#include <CrossBuildRuntime.h>
+
 #include <SteamComponentAPI.h>
 
+#include <MinMode.h>
+
 #include "GameInit.h"
+
+std::string g_lastConn;
 
 static LONG WINAPI TerminateInstantly(LPEXCEPTION_POINTERS pointers)
 {
@@ -50,6 +59,29 @@ static LONG WINAPI TerminateInstantly(LPEXCEPTION_POINTERS pointers)
 	}
 
 	return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void RestartGameToOtherBuild()
+{
+#ifdef GTA_FIVE
+	static HostSharedData<CfxState> hostData("CfxInitState");
+	auto cli = va(L"\"%s\" %s -switchcl +connect \"%s\"",
+		hostData->gameExePath,
+		Is2060() ? L"" : L"-b2060",
+		ToWide(g_lastConn));
+
+	STARTUPINFOW si = { 0 };
+	si.cb = sizeof(si);
+
+	PROCESS_INFORMATION pi;
+
+	if (!CreateProcessW(NULL, const_cast<wchar_t*>(cli), NULL, NULL, FALSE, CREATE_BREAKAWAY_FROM_JOB, NULL, NULL, &si, &pi))
+	{
+		trace("failed to exit: %d\n", GetLastError());
+	}
+
+	ExitProcess(0x69);
+#endif
 }
 
 void saveSettings(const wchar_t *json) {
@@ -145,7 +177,16 @@ static void ConnectTo(const std::string& hostnameStr)
 
 	nui::PostFrameMessage("mpMenu", R"({ "type": "connecting" })");
 
-	netLibrary->ConnectToServer(hostnameStr);
+	g_lastConn = hostnameStr;
+
+	if (!hostnameStr.empty() && hostnameStr[0] == '-')
+	{
+		netLibrary->ConnectToServer("cfx.re/join/" + hostnameStr.substr(1));
+	}
+	else
+	{
+		netLibrary->ConnectToServer(hostnameStr);
+	}
 }
 
 static std::string g_pendingAuthPayload;
@@ -154,7 +195,7 @@ static void HandleAuthPayload(const std::string& payloadStr)
 {
 	if (nui::HasMainUI())
 	{
-		auto payloadJson = nlohmann::json(payloadStr).dump();
+		auto payloadJson = nlohmann::json(payloadStr).dump(-1, ' ', false, nlohmann::detail::error_handler_t::replace);
 
 		nui::PostFrameMessage("mpMenu", fmt::sprintf(R"({ "type": "authPayload", "data": %s })", payloadJson));
 	}
@@ -170,6 +211,129 @@ static std::string g_discourseClientId;
 static std::string g_discourseUserToken;
 
 static std::string g_cardConnectionToken;
+
+struct ServerLink
+{
+	std::string rawIcon;
+	std::string hostname;
+	std::string url;
+};
+
+#include <wrl.h>
+#include <psapi.h>
+#include <propsys.h>
+#include <propkey.h>
+#include <propvarutil.h>
+#include <botan/base64.h>
+
+namespace WRL = Microsoft::WRL;
+
+static WRL::ComPtr<IShellLink> MakeShellLink(const ServerLink& link)
+{
+	WRL::ComPtr<IShellLink> psl;
+	HRESULT hr = CoCreateInstance(CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&psl));
+
+	if (SUCCEEDED(hr))
+	{
+		static HostSharedData<CfxState> hostData("CfxInitState");
+
+		wchar_t imageFileName[1024];
+
+		auto hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, hostData->GetInitialPid());
+		GetModuleFileNameEx(hProcess, NULL, imageFileName, std::size(imageFileName));
+
+		psl->SetPath(imageFileName);
+		psl->SetArguments(fmt::sprintf(L"fivem://connect/%s", ToWide(link.url)).c_str());
+
+		WRL::ComPtr<IPropertyStore> pps;
+		psl.As(&pps);
+
+		PROPVARIANT propvar;
+		hr = InitPropVariantFromString(ToWide(link.hostname).c_str(), &propvar);
+		hr = pps->SetValue(PKEY_Title, propvar);
+		hr = pps->Commit();
+		PropVariantClear(&propvar);
+
+		psl->SetIconLocation(imageFileName, -201);
+
+		if (!link.rawIcon.empty())
+		{
+			auto iconPath = MakeRelativeCitPath(fmt::sprintf(L"cache/browser/%08x.ico", HashString(link.rawIcon.c_str())));
+			
+			FILE* f = _wfopen(iconPath.c_str(), L"wb");
+
+			if (f)
+			{
+				auto data = Botan::base64_decode(link.rawIcon.substr(strlen("data:image/png;base64,")));
+
+				uint8_t iconHeader[] = {
+					0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x10, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff,
+					0xff, 0xff, 0x16, 0x00, 0x00, 0x00
+				};
+
+				*(uint32_t*)&iconHeader[14] = data.size();
+
+				fwrite(iconHeader, 1, sizeof(iconHeader), f);
+
+				fwrite(data.data(), 1, data.size(), f);
+				fclose(f);
+
+				psl->SetIconLocation(iconPath.c_str(), 0);
+			}
+		}
+	}
+
+	return psl;
+}
+
+static void UpdateJumpList(const std::vector<ServerLink>& links)
+{
+	PWSTR aumid;
+	GetCurrentProcessExplicitAppUserModelID(&aumid);
+
+	WRL::ComPtr<ICustomDestinationList> pcdl;
+	HRESULT hr = CoCreateInstance(CLSID_DestinationList, NULL, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pcdl));
+
+	if (FAILED(hr))
+	{
+		CoTaskMemFree(aumid);
+		return;
+	}
+
+	pcdl->SetAppID(aumid);
+	CoTaskMemFree(aumid);
+
+	UINT cMinSlots;
+	WRL::ComPtr<IObjectArray> poaRemoved;
+
+	hr = pcdl->BeginList(&cMinSlots, IID_PPV_ARGS(&poaRemoved));
+
+	if (FAILED(hr))
+	{
+		return;
+	}
+
+	{
+		WRL::ComPtr<IObjectCollection> poc;
+		hr = CoCreateInstance(CLSID_EnumerableObjectCollection, NULL, CLSCTX_INPROC, IID_PPV_ARGS(&poc));
+
+		if (FAILED(hr))
+		{
+			return;
+		}
+
+		for (int i = 0; i < std::min(links.size(), size_t(cMinSlots)); i++)
+		{
+			auto shellLink = MakeShellLink(links[i]);
+
+			poc->AddObject(shellLink.Get());
+		}
+
+		pcdl->AppendCategory(L"History", poc.Get());
+	}
+
+	pcdl->CommitList();
+}
 
 static InitFunction initFunction([] ()
 {
@@ -196,8 +360,22 @@ static InitFunction initFunction([] ()
 	{
 		netLibrary = lib;
 
+		netLibrary->OnConnectOKReceived.Connect([](NetAddress)
+		{
+			auto peerAddress = netLibrary->GetCurrentPeer().ToString();
+
+			nui::PostRootMessage(fmt::sprintf(R"({ "type": "setServerAddress", "data": "%s" })", peerAddress));
+		});
+
 		netLibrary->OnConnectionError.Connect([] (const char* error)
 		{
+#ifdef GTA_FIVE
+			if (strstr(error, "This server requires a different game build"))
+			{
+				RestartGameToOtherBuild();
+			}
+#endif
+
 			g_connected = false;
 
 			rapidjson::Document document;
@@ -260,7 +438,7 @@ static InitFunction initFunction([] ()
 
 		netLibrary->OnInterceptConnection.Connect([](const std::string& url, const std::function<void()>& cb)
 		{
-			if (Instance<ICoreGameInit>::Get()->GetGameLoaded())
+			if (Instance<ICoreGameInit>::Get()->GetGameLoaded() || Instance<ICoreGameInit>::Get()->HasVariable("killedGameEarly"))
 			{
 				if (!disconnected)
 				{
@@ -383,7 +561,7 @@ static InitFunction initFunction([] ()
 
 	ep.Bind("imeCommitText", [](const std::string& u8str, int rS, int rE, int p)
 	{
-		auto b = nui::GetBrowser();
+		auto b = nui::GetFocusBrowser();
 
 		if (b)
 		{
@@ -393,7 +571,7 @@ static InitFunction initFunction([] ()
 
 	ep.Bind("imeSetComposition", [](const std::string& u8str, const std::vector<std::string>& underlines, int rS, int rE, int cS, int cE)
 	{
-		auto b = nui::GetBrowser();
+		auto b = nui::GetFocusBrowser();
 
 		if (b)
 		{
@@ -410,7 +588,7 @@ static InitFunction initFunction([] ()
 
 	ep.Bind("imeCancelComposition", []()
 	{
-		auto b = nui::GetBrowser();
+		auto b = nui::GetFocusBrowser();
 
 		if (b)
 		{
@@ -434,7 +612,37 @@ static InitFunction initFunction([] ()
 		}
 	});
 
+	static std::string curChannel;
+
+	wchar_t resultPath[1024];
+
+	static std::wstring fpath = MakeRelativeCitPath(L"CitizenFX.ini");
+	GetPrivateProfileString(L"Game", L"UpdateChannel", L"production", resultPath, std::size(resultPath), fpath.c_str());
+
+	curChannel = ToNarrow(resultPath);
+
 	static ConVar<bool> uiPremium("ui_premium", ConVar_None, false);
+	static ConVar<std::string> uiUpdateChannel("ui_updateChannel", ConVar_None, curChannel);
+
+	OnGameFrame.Connect([]()
+	{
+		if (uiUpdateChannel.GetValue() != curChannel)
+		{
+			curChannel = uiUpdateChannel.GetValue();
+
+			WritePrivateProfileString(L"Game", L"UpdateChannel", ToWide(curChannel).c_str(), fpath.c_str());
+
+			rapidjson::Document document;
+			document.SetString("Restart the game to apply the update channel change.", document.GetAllocator());
+
+			rapidjson::StringBuffer sbuffer;
+			rapidjson::Writer<rapidjson::StringBuffer> writer(sbuffer);
+
+			document.Accept(writer);
+
+			nui::PostFrameMessage("mpMenu", fmt::sprintf(R"({ "type": "setWarningMessage", "message": %s })", sbuffer.GetString()));
+		}
+	});
 	
 	ConHost::OnInvokeNative.Connect([](const char* type, const char* arg)
 	{
@@ -446,7 +654,13 @@ static InitFunction initFunction([] ()
 
 	nui::OnInvokeNative.Connect([](const wchar_t* type, const wchar_t* arg)
 	{
-		if (!_wcsicmp(type, L"connectTo"))
+		if (!_wcsicmp(type, L"getMinModeInfo"))
+		{
+			auto manifest = CoreGetMinModeManifest();
+
+			nui::PostFrameMessage("mpMenu", fmt::sprintf(R"({ "type": "setMinModeInfo", "enabled": %s, "data": %s })", manifest->IsEnabled() ? "true" : "false", manifest->GetRaw()));
+		}
+		else if (!_wcsicmp(type, L"connectTo"))
 		{
 			std::wstring hostnameStrW = arg;
 			std::string hostnameStr(hostnameStrW.begin(), hostnameStrW.end());
@@ -459,6 +673,19 @@ static InitFunction initFunction([] ()
 
 			g_connected = false;
 		}
+		else if (_wcsicmp(type, L"executeCommand") == 0)
+		{
+			if (!nui::HasMainUI())
+			{
+				return;
+			}
+
+			se::ScopedPrincipal principal{
+				se::Principal{
+				"system.console" }
+			};
+			console::GetDefaultContext()->ExecuteSingleCommand(ToNarrow(arg));
+		}
 		else if (!_wcsicmp(type, L"changeName"))
 		{
 			std::string newusername = ToNarrow(arg);
@@ -468,6 +695,13 @@ static InitFunction initFunction([] ()
 					trace(va("Changed player name to %s\n", newusername.c_str()));
 					nui::PostFrameMessage("mpMenu", fmt::sprintf(R"({ "type": "setSettingsNick", "nickname": "%s" })", newusername));
 				}
+			}
+		}
+		else if (!_wcsicmp(type, L"setLocale"))
+		{
+			if (nui::HasMainUI())
+			{
+				CoreGetLocalization()->SetLocale(ToNarrow(arg));
 			}
 		}
 		else if (!_wcsicmp(type, L"loadSettings"))
@@ -541,6 +775,7 @@ static InitFunction initFunction([] ()
 				TerminateProcess(GetCurrentProcess(), 0);
 			});
 		}
+#ifdef GTA_FIVE
 		else if (!_wcsicmp(type, L"setDiscourseIdentity"))
 		{
 			try
@@ -549,6 +784,9 @@ static InitFunction initFunction([] ()
 
 				g_discourseUserToken = json.value<std::string>("token", "");
 				g_discourseClientId = json.value<std::string>("clientId", "");
+
+				Instance<ICoreGameInit>::Get()->SetData("discourseUserToken", g_discourseUserToken);
+				Instance<ICoreGameInit>::Get()->SetData("discourseClientId", g_discourseClientId);
 
 				Instance<::HttpClient>::Get()->DoPostRequest(
 					"https://lambda.fivem.net/api/validate/discourse",
@@ -598,6 +836,7 @@ static InitFunction initFunction([] ()
 				trace("failed to set discourse identity: %s\n", e.what());
 			}
 		}
+#endif
 		else if (!_wcsicmp(type, L"submitCardResponse"))
 		{
 			try
@@ -606,12 +845,55 @@ static InitFunction initFunction([] ()
 
 				if (!g_cardConnectionToken.empty())
 				{
-					netLibrary->SubmitCardResponse(json["data"].dump(), g_cardConnectionToken);
+					netLibrary->SubmitCardResponse(json["data"].dump(-1, ' ', false, nlohmann::detail::error_handler_t::replace), g_cardConnectionToken);
 				}
 			}
 			catch (const std::exception& e)
 			{
 				trace("failed to set card response: %s\n", e.what());
+			}
+		}
+		else if (!_wcsicmp(type, L"setLastServers"))
+		{
+			try
+			{
+				auto json = nlohmann::json::parse(ToNarrow(arg));
+
+				int start = json.size() > 15 ? json.size() - 15 : 0;
+				int end = json.size();
+
+				std::vector<ServerLink> links;
+
+				for (int i = end - 1; i >= start; i--)
+				{
+					if (json[i].is_null() || json[i]["hostname"].is_null() || json[i]["address"].is_null())
+					{
+						continue;
+					}
+
+					ServerLink l;
+					json[i]["hostname"].get_to(l.hostname);
+
+					if (!json[i]["rawIcon"].is_null())
+					{
+						json[i]["rawIcon"].get_to(l.rawIcon);
+					}
+
+					json[i]["address"].get_to(l.url);
+
+					if (l.url.find("cfx.re/join/") == 0)
+					{
+						l.url = "-" + l.url.substr(12);
+					}
+
+					links.push_back(std::move(l));
+				}
+
+				UpdateJumpList(links);
+			}
+			catch (const std::exception & e)
+			{
+				trace("failed to set last servers: %s\n", e.what());
 			}
 		}
 	});
@@ -649,6 +931,7 @@ static InitFunction initFunction([] ()
 
 static void ProtocolRegister()
 {
+#ifdef GTA_FIVE
 	LSTATUS result;
 
 #define CHECK_STATUS(x) \
@@ -701,6 +984,7 @@ static void ProtocolRegister()
 		CHECK_STATUS(RegSetValueExW(key, NULL, 0, REG_SZ, (BYTE*)command, (wcslen(command) * sizeof(wchar_t)) + 2));
 		CHECK_STATUS(RegCloseKey(key));
 	}
+#endif
 }
 
 void Component_RunPreInit()

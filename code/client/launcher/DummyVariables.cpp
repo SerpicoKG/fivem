@@ -7,6 +7,7 @@
 
 #include "StdInc.h"
 
+#ifdef LAUNCHER_PERSONALITY_GAME
 // dummy TLS variables to allocate TLS for the game to use
 #pragma region tls
 __declspec(thread) int tls1;
@@ -780,7 +781,6 @@ __declspec(thread) int tls768;
 __declspec(thread) int tls769;
 __declspec(thread) int tls770;
 __declspec(thread) int tls771;
-#if defined(PAYNE)
 __declspec(thread) int tls772;
 __declspec(thread) int tls773;
 __declspec(thread) int tls774;
@@ -957,6 +957,7 @@ __declspec(thread) int tls944;
 __declspec(thread) int tls945;
 __declspec(thread) int tls946;
 __declspec(thread) int tls947;
+#if defined(PAYNE) || defined(IS_RDR3)
 __declspec(thread) int tls948;
 __declspec(thread) int tls949;
 __declspec(thread) int tls950;
@@ -7139,9 +7140,16 @@ char data[0x95000];
 char dummy_seg[0x6000000];
 
 char stub_seg[0x100000];
+#elif defined(IS_RDR3)
+// only use a single segment as we're supposed to be patch-proof; we'll protect these appropriately later
+#pragma bss_seg(".cdummy")
+char dummy_seg[0x8000000];
+
+char stub_seg[0x100000];
 #elif (!defined(IS_LAUNCHER))
 #error No dummy segments defined!
 #endif
 
 #pragma data_seg(".zdata")
 char zdata[200] = { 1 };
+#endif

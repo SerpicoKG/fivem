@@ -7,6 +7,8 @@
 
 #include "StdInc.h"
 
+#ifdef LAUNCHER_PERSONALITY_MAIN
+#include <CfxLocale.h>
 #include <shellapi.h>
 #include <wincrypt.h>
 #include <wintrust.h>
@@ -21,16 +23,16 @@
 #pragma comment(lib, "wintrust")
 //#pragma comment(linker,"/manifestdependency:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
-bool Bootstrap_UpdateEXE(int exeSize)
+static bool Bootstrap_UpdateEXE(int exeSize, int version)
 {
 	_unlink("CitizenFX.exe.new");
 
 	const char* fn = "CitizenFX.exe.new";
-	CL_QueueDownload(va(CONTENT_URL "/%s/bootstrap/CitizenFX.exe.xz", GetUpdateChannel()), fn, exeSize, true);
+	CL_QueueDownload(va(CONTENT_URL "/%s/bootstrap/CitizenFX.exe.xz?version=%d", GetUpdateChannel(), version), fn, exeSize, true);
 
 	UI_DoCreation(true);
 
-	UI_UpdateText(0, L"Bootstrapping " PRODUCT_NAME L"...");
+	UI_UpdateText(0, fmt::sprintf(gettext(L"Bootstrapping %s..."), PRODUCT_NAME).c_str());
 
 	if (!DL_RunLoop())
 	{
@@ -76,7 +78,7 @@ bool Bootstrap_DoBootstrap()
 	// first check the bootstrapper version
 	char bootstrapVersion[256];
 
-	int result = DL_RequestURL(va(CONTENT_URL "/%s/bootstrap/version.txt", GetUpdateChannel()), bootstrapVersion, sizeof(bootstrapVersion));
+	int result = DL_RequestURL(va(CONTENT_URL "/%s/bootstrap/version.txt?time=%lld", GetUpdateChannel(), _time64(NULL)), bootstrapVersion, sizeof(bootstrapVersion));
 
 	if (result != 0)
 	{
@@ -96,7 +98,7 @@ bool Bootstrap_DoBootstrap()
 
 	if (version != BASE_EXE_VERSION && GetFileAttributes(MakeRelativeCitPath(L"nobootstrap.txt").c_str()) == INVALID_FILE_ATTRIBUTES)
 	{
-		return Bootstrap_UpdateEXE(exeSize);
+		return Bootstrap_UpdateEXE(exeSize, version);
 	}
 
 	// after self-updating, attempt to run install mode if needed
@@ -277,3 +279,4 @@ bool Bootstrap_RunInit()
 
 	return false;
 }
+#endif

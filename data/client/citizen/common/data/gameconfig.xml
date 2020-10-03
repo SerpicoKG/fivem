@@ -28,6 +28,10 @@
 							<PoolSize value="256"/>
 						</Item>
 						<Item>
+							<PoolName>CPickupData</PoolName>
+							<PoolSize value="300"/>
+						</Item>
+						<Item>
 							<PoolName>CNetObjPed</PoolName>
 							<PoolSize value="238"/> <!-- 110 + player count -->
 						</Item>
@@ -130,11 +134,11 @@
 						</Item>
 						<Item>
 							<PoolName>AnimStore</PoolName>
-							<PoolSize value="14700"/>
+							<PoolSize value="20000"/>
 						</Item>
 						<Item>
 							<PoolName>CGameScriptResource</PoolName>
-							<PoolSize value="3051"/>
+							<PoolSize value="3062"/>
 						</Item>
 						<Item>
 							<PoolName>CGameScriptHandlerNetwork</PoolName>
@@ -150,7 +154,7 @@
 						</Item>
 						<Item>
 							<PoolName>ClothStore</PoolName>
-							<PoolSize value="60"/>
+							<PoolSize value="600"/>
 						</Item>
 						<Item>
 							<PoolName>CombatMeleeManager_Groups</PoolName>
@@ -158,7 +162,7 @@
 						</Item>
 						<Item>
 							<PoolName>CombatMeleeManager_GroupsMP</PoolName>
-							<PoolSize value="10"/>
+							<PoolSize value="20"/>
 						</Item>
 						<Item>
 							<PoolName>CombatMountedManager_Attacks</PoolName>
@@ -270,7 +274,7 @@
 						</Item>
 						<Item>
 							<PoolName>FragmentStore</PoolName>
-							<PoolSize value="24000"/>
+							<PoolSize value="48000"/>
 						</Item>
 						<Item>
 							<PoolName>GamePlayerBroadcastDataHandler_Remote</PoolName>
@@ -314,7 +318,7 @@
 						</Item>
 						<Item>
 							<PoolName>LightEntity</PoolName>
-							<PoolSize value="4200"/>
+							<PoolSize value="4700"/>
 						</Item>
 						<Item>
 							<PoolName>MapDataLoadedNode</PoolName>
@@ -330,7 +334,7 @@
 						</Item>
 						<Item>
 							<PoolName>MetaDataStore</PoolName>
-							<PoolSize value="3000"/>
+							<PoolSize value="5000"/>
 						</Item>
 						<Item>
 							<PoolName>NavMeshes</PoolName>
@@ -354,7 +358,7 @@
 						</Item>
 						<Item>
 							<PoolName>OcclusionPathNode</PoolName>
-							<PoolSize value="5200"/>
+							<PoolSize value="5250"/>
 						</Item>
 						<Item>
 							<PoolName>OcclusionPortalEntity</PoolName>
@@ -362,7 +366,7 @@
 						</Item>
 						<Item>
 							<PoolName>OcclusionPortalInfo</PoolName>
-							<PoolSize value="500"/>
+							<PoolSize value="550"/>
 						</Item>
 						<Item>
 							<PoolName>Peds</PoolName>
@@ -394,7 +398,7 @@
 						</Item>
 						<Item>
 							<PoolName>CPickupPlacementCustomScriptData</PoolName>
-							<PoolSize value="70"/>
+							<PoolSize value="200"/>
 						</Item>
 						<Item>
 							<PoolName>CRegenerationInfo</PoolName>
@@ -426,7 +430,7 @@
 						</Item>
 						<Item>
 							<PoolName>ScaleformStore</PoolName>
-							<PoolSize value="742"/>
+							<PoolSize value="842"/>
 						</Item>
 						<Item>
 							<PoolName>ScaleformMgrArray</PoolName>
@@ -434,7 +438,7 @@
 						</Item>
 						<Item>
 							<PoolName>ScriptStore</PoolName>
-							<PoolSize value="900"/>
+							<PoolSize value="1000"/>
 						</Item>
 						<Item>
 							<PoolName>StaticBounds</PoolName>
@@ -442,7 +446,7 @@
 						</Item>
 						<Item>
 							<PoolName>tcBox</PoolName>
-							<PoolSize value="3000"/>
+							<PoolSize value="6000"/>
 						</Item>
 						<Item>
 							<PoolName>TrafficLightInfos</PoolName>
@@ -450,7 +454,7 @@
 						</Item>
 						<Item>
 							<PoolName>TxdStore</PoolName>
-							<PoolSize value="65500"/>
+							<PoolSize value="75500"/>
 						</Item>
 						<Item>
 							<PoolName>Vehicles</PoolName>
@@ -458,7 +462,7 @@
 						</Item>
 						<Item>
 							<PoolName>VehicleStreamRequest</PoolName>
-							<PoolSize value="60"/>
+							<PoolSize value="100"/>
 						</Item>
 						<Item>
 							<PoolName>VehicleStreamRender</PoolName>
@@ -608,11 +612,11 @@
 						</Item>
 						<Item>
 							<PoolName>ActionTable_Definitions</PoolName>
-							<PoolSize value="306"/>
+							<PoolSize value="310"/>
 						</Item>
 						<Item>
 							<PoolName>ActionTable_Results</PoolName>
-							<PoolSize value="474"/>
+							<PoolSize value="478"/>
 						</Item>
 						<Item>
 							<PoolName>ActionTable_Impulses</PoolName>
@@ -620,7 +624,7 @@
 						</Item>
 						<Item>
 							<PoolName>ActionTable_Interrelations</PoolName>
-							<PoolSize value="60"/>
+							<PoolSize value="61"/>
 						</Item>
 						<Item>
 							<PoolName>ActionTable_Homings</PoolName>
@@ -632,7 +636,7 @@
 						</Item>
 						<Item>
 							<PoolName>ActionTable_StrikeBones</PoolName>
-							<PoolSize value="18"/>
+							<PoolSize value="19"/>
 						</Item>
 						<Item>
 							<PoolName>ActionTable_Rumbles</PoolName>
@@ -866,10 +870,10 @@
 					<MaxMloModelInfos value="220"/>
 					<MaxPedModelInfos value="825"/>
 					<MaxTimeModelInfos value="1800"/>
-					<MaxVehicleModelInfos value="620"/>
+					<MaxVehicleModelInfos value="1024"/>
 					<MaxWeaponModelInfos value="115"/>
 					<MaxExtraPedModelInfos value="1024"/>
-					<MaxExtraVehicleModelInfos value="1024"/>
+					<MaxExtraVehicleModelInfos value="2048"/>
 					<MaxExtraWeaponModelInfos value="1024"/>
 				</ConfigModelInfo>
 
@@ -881,7 +885,7 @@
 				</ConfigExtensions>
 
 				<ConfigStreamingEngine>
-					<ArchiveCount value="2904"/>
+					<ArchiveCount value="3416"/>
 					<PhysicalStreamingBuffer value="252"/>
 					<VirtualStreamingBuffer value="1000"/>
 				</ConfigStreamingEngine>

@@ -102,7 +102,19 @@ static InitFunction initFunction([] ()
 		returnedArray = stream->ReadToEnd();
 		returnedArray.push_back(0); // zero-terminate
 
-		context.SetResult(&returnedArray[0]);
+		struct scrString
+		{
+			const void* str;
+			size_t len;
+			uint32_t magic;
+
+			scrString(const void* str, size_t len)
+				: str(str), len(len), magic(0xFEED1212)
+			{
+			}
+		};
+
+		context.SetResult(scrString{ &returnedArray[0], returnedArray.size() - 1 });
 	});
 
 #ifdef IS_FXSERVER
@@ -149,7 +161,7 @@ static InitFunction initFunction([] ()
 		fwRefContainer<vfs::Stream> stream(new vfs::Stream(device, handle));
 
 		// get data + length
-		const char* data = context.GetArgument<const char*>(2);
+		const char* data = context.CheckArgument<const char*>(2);
 		int length = context.GetArgument<int>(3);
 
 		if (length == 0 || length == -1)

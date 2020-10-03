@@ -23,6 +23,8 @@
 
 #include <Error.h>
 
+#include <CrossBuildRuntime.h>
+
 NetLibrary* g_netLibrary;
 
 #include <ws2tcpip.h>
@@ -117,8 +119,6 @@ int __stdcall CfxBind(SOCKET s, sockaddr * addr, int addrlen)
 {
 	sockaddr_in* addrIn = (sockaddr_in*)addr;
 
-	trace("binder on %i is %p\n", htons(addrIn->sin_port), (void*)s);
-
 	if (htons(addrIn->sin_port) == 6672)
 	{
 		if (wcsstr(GetCommandLine(), L"cl2"))
@@ -192,26 +192,29 @@ bool GetOurSystemKey(char* systemKey);
 #include <strsafe.h>
 #include <NetworkPlayerMgr.h>
 
+template<int Build>
 struct ScSessionAddr
 {
 	uint8_t sessionId[16];
-	ScInAddr addr;
+	PeerAddress<Build> addr;
 };
 
+template<int Build>
 struct ScUnkAddr
 {
-	ScInAddr lanAddr; // ???
+	PeerAddress<Build> lanAddr; // ???
 	uint64_t pad;
-	ScSessionAddr addr;
+	ScSessionAddr<Build> addr;
 	uint32_t unkVal;
 	char pad2[284]; // seriously this struct is weird - even in 1032
 	char systemKey[16];
 };
 
-static_assert(sizeof(ScInAddr) == (40 + 8 + 8), "ScInAddr size seems bad...");
-static_assert(sizeof(ScSessionAddr) == (56 + 8 + 8), "ScSessionAddr size seems bad...");
+static_assert(sizeof(netPeerAddress::Impl2060) == (40 + 8 + 8 + 8), "ScInAddr size seems bad...");
+static_assert(sizeof(ScSessionAddr<2060>) == (56 + 8 + 8 + 8), "ScSessionAddr size seems bad...");
 
-bool StartLookUpInAddr(void*, void*, void* us, int* unkInt, bool something, int* a, ScSessionAddr* in, void*, ScUnkAddr* out, int* outSuccess, int* outStatus) // out might be the one before, or even same as in, dunno
+template<int Build>
+bool StartLookUpInAddr(void*, void*, void* us, int* unkInt, bool something, int* a, ScSessionAddr<Build>* in, void*, ScUnkAddr<Build>* out, int* outSuccess, int* outStatus) // out might be the one before, or even same as in, dunno
 {
 	uint64_t sysKey = in->addr.unkKey1 ^ 0xFEAFEDE;
 
@@ -230,23 +233,24 @@ bool StartLookUpInAddr(void*, void*, void* us, int* unkInt, bool something, int*
 
 static void(*g_origMigrateCopy)(void*, void*);
 
+template<int Build>
 void MigrateSessionCopy(char* target, char* source)
 {
 	g_origMigrateCopy(target, source);
 
-	ScSessionAddr* sessionAddress = reinterpret_cast<ScSessionAddr*>(target - 16);
+	auto sessionAddress = reinterpret_cast<ScSessionAddr<Build>*>(target - 16);
 	
-	std::unique_ptr<NetBuffer> msgBuffer(new NetBuffer(64));
+	std::unique_ptr<net::Buffer> msgBuffer(new net::Buffer(64));
 
-	msgBuffer->Write<uint32_t>((sessionAddress->addr.ipLan & 0xFFFF) ^ 0xFEED);
+	msgBuffer->Write<uint32_t>((sessionAddress->addr.localAddr.ip.addr & 0xFFFF) ^ 0xFEED);
 	msgBuffer->Write<uint32_t>(sessionAddress->addr.unkKey1);
 
-	g_netLibrary->SendReliableCommand("msgHeHost", msgBuffer->GetBuffer(), msgBuffer->GetCurLength());
+	g_netLibrary->SendReliableCommand("msgHeHost", reinterpret_cast<const char*>(msgBuffer->GetBuffer()), msgBuffer->GetCurOffset());
 }
 
 static hook::cdecl_stub<bool()> isNetworkHost([] ()
 {
-	return hook::get_call(hook::pattern("74 50 E8 ? ? ? ? 84 C0 75 10 48").count(1).get(0).get<void>(2));
+	return hook::get_call(hook::pattern("48 8B CF 48 8B 92 E8 00 00 00 E8 ? ? ? ? E8").count(1).get(0).get<void>(15));
 });
 
 static bool* didPresenceStuff;
@@ -256,7 +260,7 @@ static hook::cdecl_stub<void()> doPresenceStuff([] ()
 	return hook::pattern("32 DB 38 1D ? ? ? ? 75 24 E8").count(1).get(0).get<void>(-6);
 });
 
-static hook::cdecl_stub<void(void*, ScSessionAddr*, int64_t, int)> joinGame([] ()
+static hook::cdecl_stub<void(void*, /*ScSessionAddr**/ void*, int64_t, int)> joinGame([] ()
 {
 	return hook::pattern("F6 81 ? ? 00 00 01 45 8B F1 45 8B E0 4C 8B").count(1).get(0).get<void>(-0x24);
 });
@@ -269,14 +273,27 @@ static hook::cdecl_stub<void(int, int, int)> hostGame([] () -> void*
 
 	// 505 has it be a xchg-type jump
 	// same for 1032
-	uint8_t* loc = hook::pattern("BA 01 00 00 00 41 B8 05 01 00 00").count(1).get(0).get<uint8_t>(11);
-
-	if (*loc == 0xE9)
+	// 1737: changed
+	if (!Is2060())
 	{
-		loc = hook::get_call(loc);
+		uint8_t* loc = hook::pattern("BA 01 00 00 00 41 B8 05 01 00 00").count(1).get(0).get<uint8_t>(11);
+
+		if (*loc == 0xE9)
+		{
+			loc = hook::get_call(loc);
+		}
+
+		return loc;
 	}
 
-	return loc + 2;
+	// 1737
+	//return (void*)0x141029A20;
+
+	// 1868
+	//return (void*)0x141037BCC;
+
+	// 2060
+	return (void*)0x1410494F8;
 });
 
 static void* getNetworkManager()
@@ -285,10 +302,13 @@ static void* getNetworkManager()
 
 	if (networkMgrPtr == nullptr)
 	{
-		char* func = (char*)hook::get_call(hook::pattern("74 50 E8 ? ? ? ? 84 C0 75 10 48").count(1).get(0).get<void>(2));
+		// safe up to 1604
+		/*char* func = (char*)hook::get_call(hook::pattern("74 50 E8 ? ? ? ? 84 C0 75 10 48").count(1).get(0).get<void>(2));
 		func += 9;
 
-		networkMgrPtr = (void**)(func + *(int32_t*)func + 4);
+		networkMgrPtr = (void**)(func + *(int32_t*)func + 4);*/
+
+		networkMgrPtr = hook::get_address<void**>(hook::get_pattern("84 C0 74 2E 48 8B 0D ? ? ? ? 48 8D 54 24 20", 7));
 	}
 
 	return *networkMgrPtr;
@@ -322,7 +342,8 @@ OnlineAddress* GetOurOnlineAddressRaw()
 
 static hook::cdecl_stub<bool()> isSessionStarted([] ()
 {
-	return hook::pattern("74 0E 83 B9 ? ? 00 00 ? 75 05 B8 01").count(1).get(0).get<void>(-12);
+	//return hook::pattern("74 0E 83 B9 ? ? 00 00 ? 75 05 B8 01").count(1).get(0).get<void>(-12);
+	return hook::get_call(hook::get_pattern("8B 86 D8 08 00 00 C1 E8 05", 13));
 });
 
 static hook::cdecl_stub<void(int reason, int, int, int, bool)> networkBail([]()
@@ -377,6 +398,7 @@ struct
 		hostResult = str;
 	}
 
+	template<int Build>
 	void process()
 	{
 		ICoreGameInit* cgi = Instance<ICoreGameInit>::Get();
@@ -408,7 +430,7 @@ struct
 		}
 		else if (state == HS_START_JOINING)
 		{
-			static ScSessionAddr netAddr;
+			static ScSessionAddr<Build> netAddr;
 			memset(&netAddr, 0, sizeof(netAddr));
 
 			netAddr.addr.secKeyTime = g_netLibrary->GetHostBase() ^ 0xABCD;
@@ -416,14 +438,14 @@ struct
 			netAddr.addr.unkKey1 = g_netLibrary->GetHostBase();
 			netAddr.addr.unkKey2 = g_netLibrary->GetHostBase();
 
-			netAddr.addr.ipLan = (g_netLibrary->GetHostNetID() ^ 0xFEED) | 0xc0a80000;
-			netAddr.addr.portLan = 6672;
+			netAddr.addr.localAddr.ip.addr = (g_netLibrary->GetHostNetID() ^ 0xFEED) | 0xc0a80000;
+			netAddr.addr.localAddr.port = 6672;
 
-			netAddr.addr.ipUnk = (g_netLibrary->GetHostNetID() ^ 0xFEED) | 0xc0a80000;
-			netAddr.addr.portUnk = 6672;
+			netAddr.addr.relayAddr.ip.addr = (g_netLibrary->GetHostNetID() ^ 0xFEED) | 0xc0a80000;
+			netAddr.addr.relayAddr.port = 6672;
 
-			netAddr.addr.ipOnline = (g_netLibrary->GetHostNetID() ^ 0xFEED) | 0xc0a80000;
-			netAddr.addr.portOnline = 6672;
+			netAddr.addr.publicAddr.ip.addr = (g_netLibrary->GetHostNetID() ^ 0xFEED) | 0xc0a80000;
+			netAddr.addr.publicAddr.port = 6672;
 
 			*(uint32_t*)&netAddr.sessionId[0] = 0x2;//g_netLibrary->GetHostBase() ^ 0xFEAFEDE;
 			*(uint32_t*)&netAddr.sessionId[8] = 0xCDCDCDCD;
@@ -581,9 +603,22 @@ struct
 				}
 			}
 
+			static uint64_t mismatchStart = UINT64_MAX;
+
 			if (isNetworkHost() && playerCount == 1 && !cgi->OneSyncEnabled && g_netLibrary->GetHostNetID() != g_netLibrary->GetServerNetID())
 			{
-				state = HS_MISMATCH;
+				if (mismatchStart == UINT64_MAX)
+				{
+					mismatchStart = GetTickCount64();
+				}
+				else if ((GetTickCount64() - mismatchStart) > 7500)
+				{
+					state = HS_MISMATCH;
+				}
+			}
+			else
+			{
+				mismatchStart = UINT64_MAX;
 			}
 		}
 		else if (state == HS_MISMATCH)
@@ -594,11 +629,26 @@ struct
 
 			state = HS_DISCONNECTING;
 		}
+		else if (state == HS_FORCE_DISCONNECT)
+		{
+			networkBail(7, -1, -1, -1, true);
+
+			state = HS_DISCONNECTING_FINAL;
+		}
 		else if (state == HS_DISCONNECTING)
 		{
 			if (!isSessionStarted())
 			{
 				state = HS_LOADED;
+			}
+		}
+		else if (state == HS_DISCONNECTING_FINAL)
+		{
+			if (!isSessionStarted())
+			{
+				cgi->OneSyncEnabled = false;
+
+				state = HS_IDLE;
 			}
 		}
 	}
@@ -646,12 +696,45 @@ void ObjectIds_BindNetLibrary(NetLibrary*);
 
 #include <CloneManager.h>
 
-static hook::cdecl_stub<void(ScPlayerData*)> _setGameGamerInfo([]()
+static hook::cdecl_stub<void(void* /* rlGamerInfo */)> _setGameGamerInfo([]()
 {
 	return hook::get_pattern("3A D8 0F 95 C3 40 0A DE 40", -0x53);
 });
 
-static ScPlayerData** g_gamerInfo;
+template<int Build>
+static rlGamerInfo<Build>** g_gamerInfo;
+
+template<int Build>
+static void RunGameFrame()
+{
+	GetOurOnlineAddressRaw();
+
+	auto gi = *g_gamerInfo<Build>;
+
+	if (!gi)
+	{
+		return;
+	}
+
+	static auto origNonce = gi->gamerId;
+	uint64_t tgtNonce;
+
+	if (Instance<ICoreGameInit>::Get()->OneSyncEnabled)
+	{
+		tgtNonce = g_netLibrary->GetServerNetID();
+	}
+	else
+	{
+		tgtNonce = origNonce;
+	}
+
+	if (gi->gamerId != tgtNonce)
+	{
+		gi->gamerId = tgtNonce;
+
+		_setGameGamerInfo(gi);
+	}
+}
 
 static HookFunction initFunction([]()
 {
@@ -704,6 +787,37 @@ static HookFunction initFunction([]()
 		}
 	});
 
+	g_netLibrary->AddReliableHandler("msgFrame", [](const char* data, size_t len)
+	{
+		net::Buffer buffer(reinterpret_cast<const uint8_t*>(data), len);
+		auto idx = buffer.Read<uint32_t>();
+
+		auto icgi = Instance<ICoreGameInit>::Get();
+
+		uint8_t strictLockdown = 0;
+
+		if (icgi->NetProtoVersion >= 0x202002271209)
+		{
+			strictLockdown = buffer.Read<uint8_t>();
+		}
+
+		static uint8_t lastStrictLockdown;
+
+		if (strictLockdown != lastStrictLockdown)
+		{
+			if (!strictLockdown)
+			{
+				icgi->ClearVariable("strict_entity_lockdown");
+			}
+			else
+			{
+				icgi->SetVariable("strict_entity_lockdown");
+			}
+
+			lastStrictLockdown = strictLockdown;
+		}
+	}, true);
+
 	/*g_netLibrary->OnInitReceived.Connect([] (NetAddress)
 	{
 		g_netLibrary->DownloadsComplete();
@@ -716,36 +830,30 @@ static HookFunction initFunction([]()
 
 	g_netLibrary->SetBase(GetTickCount());
 
-	g_gamerInfo = hook::get_address<decltype(g_gamerInfo)>(hook::get_pattern("FF C8 0F 85 AC 00 00 00 48 39 35", 11));
+	{
+		auto location = hook::get_pattern("FF C8 0F 85 AC 00 00 00 48 39 35", 11);
+
+		if (Is2060())
+		{
+			g_gamerInfo<2060> = hook::get_address<decltype(g_gamerInfo<2060>)>(location);
+		}
+		else
+		{
+			g_gamerInfo<1604> = hook::get_address<decltype(g_gamerInfo<1604>)>(location);
+		}
+	}
 
 	static bool doTickThisFrame = false;
 
 	OnGameFrame.Connect([]()
 	{
-		GetOurOnlineAddressRaw();
-
-		if (!*g_gamerInfo)
+		if (Is2060())
 		{
-			return;
-		}
-
-		static auto origNonce = (*g_gamerInfo)->gamerId;
-		uint64_t tgtNonce;
-
-		if (Instance<ICoreGameInit>::Get()->OneSyncEnabled)
-		{
-			tgtNonce = g_netLibrary->GetServerNetID();
+			RunGameFrame<2060>();
 		}
 		else
 		{
-			tgtNonce = origNonce;
-		}
-
-		if ((*g_gamerInfo)->gamerId != tgtNonce)
-		{
-			(*g_gamerInfo)->gamerId = tgtNonce;
-
-			_setGameGamerInfo(*g_gamerInfo);
+			RunGameFrame<1604>();
 		}
 	});
 
@@ -805,6 +913,11 @@ static HookFunction initFunction([]()
 				gameLoaded = false;
 			});
 
+			if (Instance<ICoreGameInit>::Get()->GetGameLoaded())
+			{
+				gameLoaded = true;
+			}
+
 			eventConnected = true;
 		}
 
@@ -812,13 +925,15 @@ static HookFunction initFunction([]()
 		{
 			gameLoaded = false;
 
-			trace("dlc mounts: %d\n", *g_dlcMountCount);
-			
 			if (*g_dlcMountCount != 132)
 			{
-				GlobalError("DLC count mismatch - %d DLC mounts exist locally, but %d are expected. Please check that you have installed all core game updates and try again.", *g_dlcMountCount, 132);
+				if (!Is2060())
+				{
+					// #TODO1737
+					GlobalError("DLC count mismatch - %d DLC mounts exist locally, but %d are expected. Please check that you have installed all core game updates and try again.", *g_dlcMountCount, 132);
 
-				return;
+					return;
+				}
 			}
 
 			hostSystem.state = HS_LOADED;
@@ -881,7 +996,14 @@ static HookFunction initFunction([]()
 
 		if (Instance<ICoreGameInit>::Get()->GetGameLoaded())
 		{
-			hostSystem.process();
+			if (Is2060())
+			{
+				hostSystem.process<2060>();			
+			}
+			else
+			{
+				hostSystem.process<1604>();
+			}
 		}
 
 		if (gameLoaded && doTickNextFrame)
@@ -918,18 +1040,18 @@ static void GetOurSecurityKey(uint64_t* key)
 	//key[1] = 0;
 }
 
-bool GetOurOnlineAddress(ScInAddr* address)
+bool GetOurOnlineAddress(netPeerAddress* address)
 {
 	memset(address, 0, sizeof(*address));
-	address->secKeyTime = g_netLibrary->GetServerBase() ^ 0xABCD;
-	address->unkKey1 = g_netLibrary->GetServerBase();
-	address->unkKey2 = g_netLibrary->GetServerBase();
-	address->ipLan = (g_netLibrary->GetServerNetID() ^ 0xFEED) | 0xc0a80000;
-	address->portLan = 6672;
-	address->ipUnk = (g_netLibrary->GetServerNetID() ^ 0xFEED) | 0xc0a80000;
-	address->portUnk = 6672;
-	address->ipOnline = (g_netLibrary->GetServerNetID() ^ 0xFEED) | 0xc0a80000;
-	address->portOnline = 6672;
+	address->secKeyTime() = g_netLibrary->GetServerBase() ^ 0xABCD;
+	address->unkKey1() = g_netLibrary->GetServerBase();
+	address->unkKey2() = g_netLibrary->GetServerBase();
+	address->localAddr().ip.addr = (g_netLibrary->GetServerNetID() ^ 0xFEED) | 0xc0a80000;
+	address->localAddr().port = 6672;
+	address->relayAddr().ip.addr = (g_netLibrary->GetServerNetID() ^ 0xFEED) | 0xc0a80000;
+	address->relayAddr().port = 6672;
+	address->publicAddr().ip.addr = (g_netLibrary->GetServerNetID() ^ 0xFEED) | 0xc0a80000;
+	address->publicAddr().port = 6672;
 	//address->pad5 = 0x19;
 
 	g_globalNetSecurityKey[0] = g_netLibrary->GetServerBase();
@@ -1170,8 +1292,6 @@ void HandleJR(char* a1, char* a2, void* a3, void* a4)
 	auto clientId = *(uint64_t*)a2;
 	auto serverId = *(uint64_t*)(a1 + 3008 + 464);
 
-	trace("snMsgJoinRequest - client's opinion: %16llx - server's opinion: %16llx\n", clientId, serverId);
-
 	if (clientId != serverId)
 	{
 		SendMetric(va("nethook:err:joinrequest:id_mismatch:%16llx:%16llx", clientId, serverId));
@@ -1235,8 +1355,6 @@ bool GetOurSessionKeyWrap(char* sessionKey)
 	if (_ReturnAddress() == g_sessionKeyReturn)
 	{
 		*(uint64_t*)sessionKey = 2;
-
-		trace("wrap session key\n");
 
 		return true;
 	}
@@ -1362,15 +1480,51 @@ static void WaitForScAndLoadMeta(const char* fn, bool a2, uint32_t a3)
 		// 1365
 		// 1493
 		// 1604
-		((void(*)())hook::get_adjusted(0x1400067E8))();
-		((void(*)())hook::get_adjusted(0x1407D1960))();
-		((void(*)())hook::get_adjusted(0x140025F7C))();
-		((void(*)(void*))hook::get_adjusted(0x141595FD4))((void*)hook::get_adjusted(0x142DC9BA0)); // rly? renderthreadinterface stuff
+		// 1737
+		// 1868
+		// 2060
+		if (!Is2060())
+		{
+			((void(*)())hook::get_adjusted(0x1400067E8))();
+			((void(*)())hook::get_adjusted(0x1407D1960))();
+			((void(*)())hook::get_adjusted(0x140025F7C))();
+			((void(*)(void*))hook::get_adjusted(0x141595FD4))((void*)hook::get_adjusted(0x142DC9BA0));
+		}
+		else
+		{
+			((void (*)())hook::get_adjusted(0x140006A80))();
+			((void (*)())hook::get_adjusted(0x1407EB39C))();
+			((void (*)())hook::get_adjusted(0x1400263A4))();
+			((void (*)(void*))hook::get_adjusted(0x1415CF268))((void*)hook::get_adjusted(0x142D3DCC0));
+		}
 
 		Sleep(0);
 	}
 
 	return _origLoadMeta(fn, a2, a3);
+}
+
+static bool (*g_origBeforeReplayLoad)();
+
+static bool BeforeReplayLoadHook()
+{
+	if (hostSystem.state == HS_HOSTED || hostSystem.state == HS_JOINED)
+	{
+		hostSystem.state = HS_FORCE_DISCONNECT;
+	}
+
+	if (!(hostSystem.state == HS_IDLE))
+	{
+		return false;
+	}
+
+	g_netLibrary->Disconnect("Entering Rockstar Editor");
+	g_netLibrary->FinalizeDisconnect();
+
+	// stop scripts from this point
+	Instance<ICoreGameInit>::Get()->SetVariable("networkTimedOut");
+
+	return g_origBeforeReplayLoad();
 }
 
 static HookFunction hookFunction([] ()
@@ -1401,7 +1555,7 @@ static HookFunction hookFunction([] ()
 	hook::jump(getNewNewVal, GetNetNewVal);
 
 	// was void* handleJoinRequestPtr = hook::pattern("4C 8D 40 48 48 8D 95 E0 00 00 00 48 8B CE E8").count(1).get(0).get<void>(14); before 372
-	void* handleJoinRequestPtr = hook::pattern("4C 8D 40 48 48 8D 95 E0 00 00 00 48 8B CE E8").count(1).get(0).get<void>(14);
+	void* handleJoinRequestPtr = hook::pattern("4C 8D 40 48 48 8D 95 ? ? 00 00 48 8B CE E8").count(1).get(0).get<void>(14);
 	hook::set_call(&g_origJR, handleJoinRequestPtr);
 	hook::call(handleJoinRequestPtr, HandleJR);
 
@@ -1435,9 +1589,9 @@ static HookFunction hookFunction([] ()
 	// 463/505 change
 	//void* migrateCmd = hook::pattern("48 8B 47 78 48 81 C1 90 00 00 00 48 89 41 F8").count(1).get(0).get<void>(15);
 	// 1032 change
-	void* migrateCmd = hook::pattern("48 8B 47 78 48 81 C1 98 00 00 00 48 89 41 F8").count(1).get(0).get<void>(15);
+	void* migrateCmd = hook::get_pattern((Is2060()) ? "48 8B 87 80 00 00 00 48 81 C1 A0 00 00 00" : "48 8B 47 78 48 81 C1 98 00 00 00 48 89 41 F8", (Is2060()) ? 0x12 : 15);
 	hook::set_call(&g_origMigrateCopy, migrateCmd);
-	hook::call(migrateCmd, MigrateSessionCopy);
+	hook::call(migrateCmd, (Is2060()) ? (void*)&MigrateSessionCopy<2060> : &MigrateSessionCopy<1604>);
 
 	// session key getting system key; replace with something static for migration purposes
 	//hook::call(hook::pattern("74 15 48 8D 4C 24 78 E8").count(1).get(0).get<void>(7), GetOurSessionKey);
@@ -1483,32 +1637,52 @@ static HookFunction hookFunction([] ()
 
 	// we also need some pointers from this function
 	//char* netAddressFunc = hook::pattern("48 89 39 48 89 79 08 89 71 10 66 89 79 14 89 71").count(1).get(0).get<char>(-0x1E);
-	char* netAddressFunc = hook::pattern("89 79 10 48 89 39 48 89 79 08 89 69 14 66 89 79").count(1).get(0).get<char>(-0x23);
-	hook::jump(netAddressFunc, GetOurOnlineAddress);
 
-	// added in 393
-	//hook::jump(hook::get_call(netAddressFunc + 0x5D), HashSecKeyAddress);
-	//hook::jump(hook::get_call(netAddressFunc + 0x61), HashSecKeyAddress); // 505-1032
-	hook::jump(hook::get_call(netAddressFunc + 0x66), HashSecKeyAddress); // 1103
+	char* onlineAddressFunc;
 
-	//char* onlineAddressFunc = hook::get_call(netAddressFunc + 0x75); // 350-
-	//char* onlineAddressFunc = hook::get_call(netAddressFunc + 0x78); // 372
-	//char* onlineAddressFunc = hook::get_call(netAddressFunc + 0x88); // 393
-	char* onlineAddressFunc = hook::get_call(netAddressFunc + 0x6B); // 505
-	// ^ 372 change, 393 change, 505 change
+	if (!Is2060())
+	{
+		char* netAddressFunc = hook::pattern("89 79 10 48 89 39 48 89 79 08 89 69 14 66 89 79").count(1).get(0).get<char>(-0x23);
+		hook::jump(netAddressFunc, GetOurOnlineAddress);
 
-	netAddressFunc += 0x1F;
+		// added in 393
+		//hook::jump(hook::get_call(netAddressFunc + 0x5D), HashSecKeyAddress);
+		//hook::jump(hook::get_call(netAddressFunc + 0x61), HashSecKeyAddress); // 505-1032
+		hook::jump(hook::get_call(netAddressFunc + 0x66), HashSecKeyAddress); // 1103
 
-	bool* didNetAddressBool = (bool*)(netAddressFunc + *(int32_t*)netAddressFunc + 4);
+		//char* onlineAddressFunc = hook::get_call(netAddressFunc + 0x75); // 350-
+		//char* onlineAddressFunc = hook::get_call(netAddressFunc + 0x78); // 372
+		//char* onlineAddressFunc = hook::get_call(netAddressFunc + 0x88); // 393
+		onlineAddressFunc = hook::get_call(netAddressFunc + 0x6B); // 505
+		// ^ 372 change, 393 change, 505 change
 
-	*didNetAddressBool = true;
+		netAddressFunc += 0x1F;
 
-	//netAddressFunc += 0x25;
-	//netAddressFunc += 0x28; // <- 372
-	//netAddressFunc += 0x37; // <- 393
-	netAddressFunc += 0x3B; // <- 505
+		bool* didNetAddressBool = (bool*)(netAddressFunc + *(int32_t*)netAddressFunc + 4);
 
-	g_globalNetSecurityKey = (uint64_t*)(netAddressFunc + *(int32_t*)netAddressFunc + 4);
+		*didNetAddressBool = true;
+
+		//netAddressFunc += 0x25;
+		//netAddressFunc += 0x28; // <- 372
+		//netAddressFunc += 0x37; // <- 393
+		netAddressFunc += 0x3B; // <- 505
+
+		g_globalNetSecurityKey = (uint64_t*)(netAddressFunc + *(int32_t*)netAddressFunc + 4);
+	}
+	else
+	{
+		char* netAddressFunc = hook::get_pattern<char>("89 79 10 48 89 39 48 89 79 08 89 69 14 66 89 79", -0x22);
+		hook::jump(netAddressFunc, GetOurOnlineAddress);
+
+		hook::jump(hook::get_call(netAddressFunc + 0x6F), HashSecKeyAddress);
+
+		onlineAddressFunc = hook::get_call(netAddressFunc + 0x74);
+
+		bool* didNetAddressBool = hook::get_address<bool*>(netAddressFunc + 0x1E);
+		*didNetAddressBool = true;
+
+		g_globalNetSecurityKey = hook::get_address<uint64_t*>(netAddressFunc + 0x63);
+	}
 
 	hook::jump(onlineAddressFunc, GetOurOnlineAddressRaw);
 
@@ -1531,7 +1705,8 @@ static HookFunction hookFunction([] ()
 	hook::call(hook::pattern("48 83 EC 20 48 8B DA BE 01 00 00 00 32 D2 8B F9").count(1).get(0).get<void>(-0xB), itemHook.GetCode());
 
 	// network frame
-	location = hook::pattern("C7 45 10 8B 30 7A FE E8 ? ? ? ? 4C 8D 45 10 48 8D 15 ? ? ? ? F3 0F 11").count(1).get(0).get<char>(19);
+	// 1737: Rockstar, please, why are you obfuscating gameSkeleton init???
+	/*location = hook::pattern("C7 45 10 8B 30 7A FE E8 ? ? ? ? 4C 8D 45 10 48 8D 15 ? ? ? ? F3 0F 11").count(1).get(0).get<char>(19);
 
 	uintptr_t addr = (uintptr_t)(location + *(int32_t*)location + 4);
 
@@ -1542,7 +1717,7 @@ static HookFunction hookFunction([] ()
 	}
 
 	hook::set_call(&origNetFrame, addr);
-	hook::jump(addr, CustomNetFrame);
+	hook::jump(addr, CustomNetFrame);*/
 
 	// network game unsetters
 	/*location = hook::pattern("88 1D ? ? ? ? 84 C0 75 33 E8").count(1).get(0).get<char>(2);
@@ -1575,7 +1750,8 @@ static HookFunction hookFunction([] ()
 	// locate address thingy
 	//hook::call(hook::pattern("89 44 24 28 41 8B 87 80 01 00 00 48 8B CB 89 44").count(1).get(0).get<void>(18), StartLookUpInAddr);
 	//hook::jump(hook::get_call(hook::pattern("48 8B D0 C7 44 24 28 04 00 00 00 44 89 7C 24 20").count(1).get(0).get<void>(16)), StartLookUpInAddr);
-	hook::jump(hook::get_call(hook::pattern("45 33 C0 C6 44 24 28 01 44 89 7C 24 20").count(1).get(0).get<void>(13)), StartLookUpInAddr);
+	hook::jump(hook::get_call(hook::pattern("45 33 C0 C6 44 24 28 01 44 89 7C 24 20").count(1).get(0).get<void>(13)), 
+		(Is2060()) ? (void*)StartLookUpInAddr<2060> : StartLookUpInAddr<1604>);
 
 	// temp dbg: always clone a player (to see why this CTaskMove flag is being a twat)
 	//hook::jump(hook::pattern("74 06 F6 40 2F 01 75 0E 48 8B D7").count(1).get(0).get<void>(-0x27), ReturnTrue);
@@ -1719,8 +1895,8 @@ static HookFunction hookFunction([] ()
 	// MARK!
 
 	// objectmgr bandwidth stuff?
-	hook::put<uint8_t>(hook::pattern("F6 82 98 00 00 00 01 74 2C 48").count(1).get(0).get<void>(7), 0xEB);
-	hook::put<uint8_t>(hook::pattern("74 21 80 7F 2D FF B3 01 74 19 0F").count(1).get(0).get<void>(8), 0xEB);
+	hook::put<uint8_t>(hook::pattern("F6 82 ? 00 00 00 01 74 2C 48").count(1).get(0).get<void>(7), 0xEB);
+	hook::put<uint8_t>(hook::pattern("74 21 80 7F ? FF B3 01 74 19 0F").count(1).get(0).get<void>(8), 0xEB);
 
 	// even more stuff in the above function?!
 	hook::nop(hook::pattern("85 ED 78 52 84 C0 74 4E 48").count(1).get(0).get<void>(), 8);
@@ -1771,7 +1947,10 @@ static HookFunction hookFunction([] ()
 
 	// don't switch clipset manager to network mode
 	// (blocks on a LoadAllObjectsNow after scene has initialized already)
-	hook::nop(hook::get_pattern("84 C0 75 33 E8 ? ? ? ? 83", 4), 5);
+	if (!Is2060()) // arxan
+	{
+		hook::nop(hook::get_pattern("84 C0 75 33 E8 ? ? ? ? 83", 4), 5);
+	}
 
 	// don't switch to SP mode either
 	hook::return_function(hook::get_pattern("48 8D 2D ? ? ? ? 8B F0 85 C0 0F", -0x15));
@@ -1824,7 +2003,11 @@ static HookFunction hookFunction([] ()
 	// disable unknown stuff
 	{
 		// 1032/1103!
-		hook::return_function(hook::get_pattern("44 8B 99 08 E0 00 00 4C 8B C9 B9 00 04", 0));
+		if (!Is2060())
+		{
+			// 1868 integrity checks this
+			hook::return_function(hook::get_pattern("44 8B 99 08 E0 00 00 4C 8B C9 B9 00 04", 0));
+		}
 	}
 
 	// network timeout
@@ -1881,6 +2064,11 @@ static HookFunction hookFunction([] ()
 		OnLookAliveFrame.Connect([_processEntitlements]()
 		{
 			_processEntitlements();
+
+			if (!Instance<ICoreGameInit>::Get()->GetGameLoaded())
+			{
+				g_netLibrary->RunMainFrame();
+			}
 		});
 	}
 
@@ -1916,6 +2104,13 @@ static HookFunction hookFunction([] ()
 
 		hook::set_call(&_origLoadMeta, location);
 		hook::call(location, WaitForScAndLoadMeta);
+	}
+
+	// replay editor unload wait
+	{
+		auto location = hook::get_pattern("0F 85 ? ? ? ? 33 DB 38 1D ? ? ? ? 75", -0x14);
+		MH_CreateHook(location, BeforeReplayLoadHook, (void**)&g_origBeforeReplayLoad);
+		MH_EnableHook(MH_ALL_HOOKS);
 	}
 
 	// default netnoupnp and netnopcp to true

@@ -273,7 +273,7 @@ namespace CitizenFX.Core
 		}
 
 #if USE_HYPERDRIVE
-		internal unsafe delegate void CallFunc(void* cxtRef);
+		internal unsafe delegate bool CallFunc(void* cxtRef, void** errorPtr);
 
 		[ThreadStatic]
 		private static Dictionary<ulong, CallFunc> ms_invokers = new Dictionary<ulong, CallFunc>();
@@ -283,26 +283,32 @@ namespace CitizenFX.Core
 		[SecurityCritical]
 		internal unsafe static CallFunc DoGetNative(ulong native)
 		{
-			return BuildFunction(GetNative(native));
+			return BuildFunction(native, GetNative(native));
 		}
 
 		[SecurityCritical]
-		private unsafe static CallFunc BuildFunction(ulong ptr)
+		private unsafe static CallFunc BuildFunction(ulong native, ulong ptr)
 		{
 			var method = new DynamicMethod($"NativeCallFn_{ptr}",
-				typeof(void), new Type[1] { typeof(void*) }, typeof(ScriptContext).Module);
+				typeof(bool), new Type[2] { typeof(void*), typeof(void**) }, typeof(ScriptContext).Module);
 
 			ILGenerator generator = method.GetILGenerator();
 			generator.Emit(OpCodes.Ldc_I8, (long)ptr);
+			generator.Emit(OpCodes.Ldc_I8, (long)native);
 			generator.Emit(OpCodes.Ldarg_0);
+			generator.Emit(OpCodes.Ldarg_1);
 			generator.Emit(OpCodes.Ldc_I8, ms_nativeInvokeFn);
-			generator.EmitCalli(OpCodes.Calli, CallingConventions.Standard, typeof(void), new Type[2] { typeof(void*), typeof(void*) }, null);
+			generator.EmitCalli(OpCodes.Calli, CallingConventions.Standard, typeof(bool), new Type[4] { typeof(void*), typeof(ulong), typeof(void*), typeof(void**) }, null);
 			generator.Emit(OpCodes.Ret);
 
 			return (CallFunc)method.CreateDelegate(typeof(CallFunc));
 		}
 
+#if IS_RDR3
+		[DllImport("rage-scripting-rdr3.dll", EntryPoint = "?GetNativeHandler@scrEngine@rage@@SAP6AXPEAVscrNativeCallContext@2@@Z_K@Z")]
+#else
 		[DllImport("rage-scripting-five.dll", EntryPoint = "?GetNativeHandler@scrEngine@rage@@SAP6AXPEAVscrNativeCallContext@2@@Z_K@Z")]
+#endif
 		private static extern ulong GetNative(ulong hash);
 
 		[DllImport("kernel32.dll")]
@@ -340,22 +346,56 @@ namespace CitizenFX.Core
 			unsafe
 			{
 #if !USE_HYPERDRIVE
-				scriptHost.InvokeNative(new IntPtr(cxt));
+				try
+				{
+					scriptHost.InvokeNative(new IntPtr(cxt));
+				}
+				catch (ArgumentException e)
+				{
+					IntPtr errorString = scriptHost.GetLastErrorText();
+					byte* error = (byte*)errorString.ToPointer();
+
+					throw new InvalidOperationException(ErrorHandler(error));
+				}
 #else
 				if (!ms_invokers.TryGetValue(nativeIdentifier, out CallFunc invoker))
 				{
-					invoker = BuildFunction(GetNative(nativeIdentifier));
+					invoker = BuildFunction(nativeIdentifier, GetNative(nativeIdentifier));
 					ms_invokers.Add(nativeIdentifier, invoker);
 				}
 
 				cxt->functionDataPtr = &cxt->functionData[0];
 				cxt->retDataPtr = &cxt->functionData[0];
 
-				invoker(cxt);
+				byte* error = null;
+
+				if (!invoker(cxt, (void**)&error))
+				{
+					throw new InvalidOperationException(ErrorHandler(error));
+				}
 
 				CopyReferencedParametersOut(cxt);
 #endif
 			}
+		}
+
+		[SecurityCritical]
+		internal unsafe static string ErrorHandler(byte* error)
+		{
+			if (error != null)
+			{
+				var errorStart = error;
+				int length = 0;
+
+				for (var p = errorStart; *p != 0; p++)
+				{
+					length++;
+				}
+
+				return Encoding.UTF8.GetString(errorStart, length);
+			}
+
+			return "Native invocation failed.";
 		}
 
 #if USE_HYPERDRIVE

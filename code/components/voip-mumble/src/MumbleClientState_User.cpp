@@ -10,6 +10,8 @@
 #include "MumbleClientImpl.h"
 #include "MumbleMessageHandler.h"
 
+#include <CoreConsole.h>
+
 MumbleUser::MumbleUser(MumbleClient* client, MumbleProto::UserState& userState)
 	: m_client(client)
 {
@@ -33,7 +35,16 @@ void MumbleUser::UpdateUser(MumbleProto::UserState& state)
 
 	if (state.has_name())
 	{
-		m_name = ConvertFromUTF8(state.name());
+		std::string name = state.name();
+		m_name = ConvertFromUTF8(name);
+		if (name.length() >= 2)
+		{
+			m_serverId = atoi(name.substr(1, name.length() - 1).c_str());
+		} 
+		else
+		{
+			m_serverId = 0;
+		}
 	}
 
 	if (state.has_mute())
@@ -87,7 +98,7 @@ void MumbleClientState::ProcessUserState(MumbleProto::UserState& userState)
 
 			auto name = user->GetName();
 
-			trace("New user: %s\n", std::string(name.begin(), name.end()).c_str());
+			console::DPrintf("Mumble", "New user: %s\n", std::string(name.begin(), name.end()).c_str());
 		}
 		else
 		{
